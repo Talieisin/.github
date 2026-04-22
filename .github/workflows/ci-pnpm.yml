@@ -4,7 +4,7 @@ on:
     inputs:
       node-version:
         type: string
-        default: "22"
+        default: "24"
       pnpm-version:
         type: string
         default: "10"
