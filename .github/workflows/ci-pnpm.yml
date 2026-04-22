@@ -1,0 +1,33 @@
+name: CI pnpm
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "20"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Detect scripts
+        id: scripts
+        run: |
+          has_build=$(jq -r 'has("scripts") and (.scripts | has("build"))' package.json)
+          has_test=$(jq -r 'has("scripts") and (.scripts | has("test"))' package.json)
+          echo "has_build=$has_build" >> "$GITHUB_OUTPUT"
+          echo "has_test=$has_test" >> "$GITHUB_OUTPUT"
+      - name: Build
+        if: steps.scripts.outputs.has_build == 'true'
+        run: pnpm run build
+      - name: Test
+        if: steps.scripts.outputs.has_test == 'true'
+        run: pnpm test

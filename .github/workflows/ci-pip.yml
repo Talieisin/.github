@@ -1,0 +1,39 @@
+name: CI pip
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        type: string
+        default: "3.12"
+      requirements-file:
+        type: string
+        default: "requirements.txt"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "${{ inputs.requirements-file }}" ]; then
+            pip install -r "${{ inputs.requirements-file }}"
+          elif [ -f "pyproject.toml" ]; then
+            pip install -e .
+          fi
+      - name: Compile check
+        run: |
+          python -m compileall -q -x 'venv|\.venv|build|dist' .
+      - name: Run pytest if present
+        run: |
+          if [ -d "tests" ] || [ -d "test" ] || ls test_*.py *_test.py 2>/dev/null | grep -q .; then
+            pip install pytest
+            pytest
+          else
+            echo "No tests found, skipping"
+          fi

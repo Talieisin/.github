@@ -1,0 +1,34 @@
+name: CI terraform
+on:
+  workflow_call:
+    inputs:
+      directories:
+        type: string
+        description: 'JSON array of terraform directories'
+        default: '["."]'
+      terraform-version:
+        type: string
+        default: "latest"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(inputs.directories) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+      - name: Format check
+        run: terraform fmt -check -recursive
+        working-directory: ${{ matrix.dir }}
+        continue-on-error: true
+      - name: Init
+        run: terraform init -backend=false
+        working-directory: ${{ matrix.dir }}
+      - name: Validate
+        run: terraform validate
+        working-directory: ${{ matrix.dir }}
