@@ -21,10 +21,17 @@ jobs:
           if uv run --no-sync python -c "import ruff" 2>/dev/null || grep -q 'ruff' pyproject.toml 2>/dev/null; then
             uv run ruff check . || true
           fi
-      - name: Run tests if present
+      - name: Run tests
         run: |
-          if [ -d "tests" ] || [ -d "test" ]; then
-            uv run pytest
-          else
-            echo "No tests found, skipping"
+          # Let pytest discover tests (test_*.py / *_test.py anywhere under cwd).
+          # Exit code 5 means "no tests collected" — treat as success so the
+          # workflow is safe to adopt in repos that don't have tests yet.
+          set +e
+          uv run pytest
+          code=$?
+          set -e
+          if [ $code -eq 5 ]; then
+            echo "No tests collected, skipping"
+            exit 0
           fi
+          exit $code
