@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # These workflows are consumed by every repo in the org: keep the action
+  # pins fresh here.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      all-version:
+        applies-to: version-updates
+        patterns: ["*"]
+      security:
+        applies-to: security-updates
+        patterns: ["*"]

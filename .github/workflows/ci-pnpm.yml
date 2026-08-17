@@ -1,0 +1,51 @@
+name: CI pnpm
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "24"
+      pnpm-version:
+        type: string
+        # Pass "" to defer to package.json "packageManager". pnpm/action-setup
+        # errors when this input is set and disagrees with that field, so a repo
+        # pinning an exact pnpm should either pass "" (single source of truth)
+        # or pass the identical exact version.
+        default: "10"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ inputs.pnpm-version }}
+      # Must stay after pnpm/action-setup: setup-node's pnpm cache resolution
+      # shells out to `pnpm store path`, so pnpm has to be on PATH already.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'pnpm'
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Detect scripts
+        id: scripts
+        run: |
+          has_typecheck=$(jq -r 'has("scripts") and (.scripts | has("typecheck"))' package.json)
+          has_build=$(jq -r 'has("scripts") and (.scripts | has("build"))' package.json)
+          has_test=$(jq -r 'has("scripts") and (.scripts | has("test"))' package.json)
+          echo "has_typecheck=$has_typecheck" >> "$GITHUB_OUTPUT"
+          echo "has_build=$has_build" >> "$GITHUB_OUTPUT"
+          echo "has_test=$has_test" >> "$GITHUB_OUTPUT"
+      # Runs before build so a project that only wants type validation does not
+      # need a no-op `build` script purely to get checked.
+      - name: Typecheck
+        if: steps.scripts.outputs.has_typecheck == 'true'
+        run: pnpm run typecheck
+      - name: Build
+        if: steps.scripts.outputs.has_build == 'true'
+        run: pnpm run build
+      - name: Test
+        if: steps.scripts.outputs.has_test == 'true'
+        run: pnpm test

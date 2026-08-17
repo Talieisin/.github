@@ -1,0 +1,178 @@
+name: Validated push
+description: >
+  Deterministic trusted-zone push of an AI-produced patch: recheck PR
+  state/head, apply the patch, validate the STAGED result (rename/symlink
+  aware deny-list, mode checks, size limits), commit as the App, push with
+  force-with-lease against the expected SHA. Labels and sticky comments are
+  the CALLER's job — this action only reports an outcome.
+
+inputs:
+  token:
+    description: Repo-scoped automation App installation token (contents+PR write)
+    required: true
+  app-slug:
+    description: Slug of the App the token belongs to (commit author identity)
+    required: true
+  repo:
+    description: owner/name of the repository
+    required: true
+  pr-number:
+    description: Pull request number
+    required: true
+  head-ref:
+    description: PR head branch name
+    required: true
+  expected-sha:
+    description: The head SHA this patch was produced against
+    required: true
+  patch-path:
+    description: Absolute path to the patch file (git diff --binary format)
+    required: true
+  commit-message:
+    description: Commit message headline
+    required: true
+  commit-body:
+    description: Commit message body
+    required: false
+    default: ""
+  create-branch:
+    description: >
+      "true" = head-ref is a NEW branch to create from base-ref (which must
+      sit at expected-sha); fails if the branch already exists. Default mode
+      updates an existing head-ref with force-with-lease.
+    required: false
+    default: "false"
+  base-ref:
+    description: Base branch to branch from (create-branch mode only)
+    required: false
+    default: ""
+
+outputs:
+  outcome:
+    description: "pushed | empty | stale | closed | violation | error"
+    value: ${{ steps.push.outputs.outcome }}
+  new-sha:
+    description: SHA of the pushed commit (empty unless outcome=pushed)
+    value: ${{ steps.push.outputs.new-sha }}
+  detail:
+    description: Human-readable detail for violation/stale/error outcomes
+    value: ${{ steps.push.outputs.detail }}
+
+runs:
+  using: composite
+  steps:
+    - name: Recheck PR state
+      id: state
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        EXPECTED_SHA: ${{ inputs.expected-sha }}
+        PATCH: ${{ inputs.patch-path }}
+        CREATE_BRANCH: ${{ inputs.create-branch }}
+        BASE_REF: ${{ inputs.base-ref }}
+      run: |
+        set -euo pipefail
+        verdict_out() { echo "verdict=$1" >> "$GITHUB_OUTPUT"; echo "detail=${2:-}" >> "$GITHUB_OUTPUT"; }
+        if [ ! -s "$PATCH" ]; then verdict_out empty; exit 0; fi
+        if [ "$CREATE_BRANCH" = "true" ]; then
+          # New-branch mode: no PR exists yet. Verify the target branch is
+          # absent (dedupe guarantee) and the base still sits at expected-sha.
+          if gh api "repos/$REPO/git/ref/heads/$HEAD_REF" > /dev/null 2>&1; then
+            verdict_out exists "branch $HEAD_REF already exists"; exit 0
+          fi
+          current=$(gh api "repos/$REPO/git/ref/heads/$BASE_REF" --jq .object.sha)
+          if [ "$current" != "$EXPECTED_SHA" ]; then
+            verdict_out stale "base moved $EXPECTED_SHA -> $current"; exit 0
+          fi
+          verdict_out proceed; exit 0
+        fi
+        state=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.state + " " + (.merged|tostring) + " " + .head.sha')
+        read -r pr_state pr_merged current <<< "$state"
+        if [ "$pr_state" != "open" ] || [ "$pr_merged" = "true" ]; then
+          verdict_out closed "PR state=$pr_state merged=$pr_merged"; exit 0
+        fi
+        if [ "$current" != "$EXPECTED_SHA" ]; then
+          verdict_out stale "branch moved $EXPECTED_SHA -> $current"; exit 0
+        fi
+        verdict_out proceed
+    - name: Checkout PR branch
+      if: steps.state.outputs.verdict == 'proceed'
+      uses: actions/checkout@v7
+      with:
+        repository: ${{ inputs.repo }}
+        ref: ${{ inputs.create-branch == 'true' && inputs.base-ref || inputs.head-ref }}
+        token: ${{ inputs.token }}
+        path: validated-push-workspace
+    - name: Apply, validate staged result, push
+      id: push
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERDICT: ${{ steps.state.outputs.verdict }}
+        STATE_DETAIL: ${{ steps.state.outputs.detail }}
+        EXPECTED_SHA: ${{ inputs.expected-sha }}
+        HEAD_REF: ${{ inputs.head-ref }}
+        PATCH: ${{ inputs.patch-path }}
+        APP_SLUG: ${{ inputs.app-slug }}
+        CREATE_BRANCH: ${{ inputs.create-branch }}
+        MSG: ${{ inputs.commit-message }}
+        MSG_BODY: ${{ inputs.commit-body }}
+      run: |
+        set -euo pipefail
+        out() { echo "outcome=$1" >> "$GITHUB_OUTPUT"; echo "new-sha=${2:-}" >> "$GITHUB_OUTPUT"; echo "detail=${3:-}" >> "$GITHUB_OUTPUT"; }
+        if [ "$VERDICT" != "proceed" ]; then out "$VERDICT" "" "$STATE_DETAIL"; exit 0; fi
+        cd validated-push-workspace
+        if [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]; then
+          out stale "" "checkout drifted from expected SHA"; exit 0
+        fi
+        if ! git apply --index "$PATCH"; then
+          out error "" "git apply failed (patch does not fit the tree)"; exit 0
+        fi
+        # Validate the STAGED result, not the patch text: rename/copy diffs
+        # only show the destination in --numstat, so inspect both sides of
+        # every staged change with rename detection off, plus file modes
+        # (no symlinks, no submodule pointers).
+        set +e
+        violation=$(git diff --cached --raw --no-renames -z HEAD | python3 -c '
+        import re, sys
+        DENY = re.compile(
+            r"^\.github/(workflows|actions)/|^action\.ya?ml$|(^|/)CODEOWNERS$"
+            r"|^\.gitmodules$|^\.github/dependabot\.ya?ml$"
+            r"|^\.github/org-automation\.yml$|^\.github/\.no-org-automation$")
+        data = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+        fields = data.split("\0")
+        problems, count = [], 0
+        i = 0
+        while i + 1 < len(fields) and fields[i]:
+            meta = fields[i]  # :oldmode newmode oldsha newsha status
+            path = fields[i + 1]
+            i += 2
+            count += 1
+            parts = meta.lstrip(":").split(" ")
+            newmode, status = parts[1], parts[4]
+            if DENY.search(path):
+                problems.append(f"{status} {path}")
+            if newmode in ("120000", "160000"):
+                problems.append(f"mode {newmode} {path}")
+        if count > 100:
+            problems.append(f"{count} files changed (limit 100)")
+        print("; ".join(problems))
+        ')
+        rc=$?
+        set -e
+        if [ $rc -ne 0 ]; then out error "" "staged-diff validation errored"; exit 0; fi
+        if [ -n "$violation" ]; then out violation "" "$violation"; exit 0; fi
+        uid=$(gh api "users/${APP_SLUG}%5Bbot%5D" --jq .id)
+        git config user.name "${APP_SLUG}[bot]"
+        git config user.email "${uid}+${APP_SLUG}[bot]@users.noreply.github.com"
+        git commit -m "$MSG" -m "$MSG_BODY"
+        if [ "$CREATE_BRANCH" = "true" ]; then
+          # New branch: plain push, never force; failure means a concurrent
+          # run created it first (dedupe holds).
+          git push origin "HEAD:refs/heads/$HEAD_REF"
+        else
+          git push origin "HEAD:$HEAD_REF" --force-with-lease="$HEAD_REF:$EXPECTED_SHA"
+        fi
+        out pushed "$(git rev-parse HEAD)"
