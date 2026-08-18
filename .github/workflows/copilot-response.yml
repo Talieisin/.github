@@ -372,8 +372,8 @@ jobs:
             + (if (.findings | length) > 0
                then ([.findings[] | "- **" + .id + "** — **" + (.verdict | gsub("_"; " ")) + "**: " + .note] | join("\n"))
                else "_(no verdicts recorded)_" end)
-            + "\n\n**Changes:** " + (if (.changes_made // "") == "" then "none" else .changes_made end)
-            + "\n**Tests:** " + (.test_results // "-")
+            + "\n\n**Changes:**\n\n" + (if (.changes_made // "") == "" then "none" else .changes_made end)
+            + "\n\n**Tests:**\n\n" + (.test_results // "-")
             + (if .error then "\n**Error:** " + .error else "" end)' "$SUMMARY" 2>/dev/null || echo "(no summary)")
           gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$disposition${VP_SHA:+
 

@@ -29,15 +29,23 @@ jobs:
           REVIEWERS: ${{ vars.AI_MERGE_REVIEWERS }}
         run: |
           set -euo pipefail
+          # Best-effort inbox hygiene: never fail the job over it, and run
+          # two passes because the CODEOWNERS request can land moments
+          # after this workflow starts.
           [ -n "${REVIEWERS:-}" ] || exit 0
-          current=$(gh api "repos/$REPO/pulls/$NUMBER/requested_reviewers" --jq '[.users[].login]')
-          while read -r r; do
-            [ -n "$r" ] || continue
-            if printf '%s' "$current" | jq -e --arg r "$r" 'map(ascii_downcase) | index($r | ascii_downcase)' > /dev/null; then
-              gh api -X DELETE "repos/$REPO/pulls/$NUMBER/requested_reviewers" -f "reviewers[]=$r" > /dev/null || true
-              echo "Removed at-open review request for $r"
-            fi
-          done < <(printf '%s\n' "$REVIEWERS" | tr ',' '\n' | tr -d ' ')
+          for pass in 1 2; do
+            [ "$pass" = "1" ] || sleep 10
+            current=$(gh api "repos/$REPO/pulls/$NUMBER/requested_reviewers" --jq '[.users[].login]') \
+              || { echo "pass $pass: could not read requested reviewers (non-fatal)"; continue; }
+            while read -r r; do
+              [ -n "$r" ] || continue
+              if printf '%s' "$current" | jq -e --arg r "$r" 'map(ascii_downcase) | index($r | ascii_downcase)' > /dev/null; then
+                gh api -X DELETE "repos/$REPO/pulls/$NUMBER/requested_reviewers" -f "reviewers[]=$r" > /dev/null \
+                  && echo "pass $pass: removed at-open review request for $r" \
+                  || echo "pass $pass: removal for $r failed (non-fatal)"
+              fi
+            done < <(printf '%s\n' "$REVIEWERS" | tr ',' '\n' | tr -d ' ')
+          done
       - name: Auto-approve and enable auto-merge
         if: steps.meta.outputs.update-type != 'version-update:semver-major'
         run: |
