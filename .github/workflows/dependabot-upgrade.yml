@@ -1111,8 +1111,7 @@ jobs:
               [ -n "$r" ] || continue
               gh api -X POST "repos/$REPO/pulls/$PR_NUMBER/requested_reviewers" -f "reviewers[]=$r" > /dev/null \
                 || echo "review request for $r failed (non-fatal)"
-            done < <(printf '%s
-' "$MERGE_REVIEWERS" | tr ',' '\n' | tr -d ' ')
+            done < <(printf '%s\n' "$MERGE_REVIEWERS" | tr ',' '\n' | tr -d ' ')
           fi
           cid=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
                 --jq '[.[] | select((.user.login == "'"$APP_SLUG"'[bot]") and (.body | startswith("'"$STICKY_MARKER"'")))][0].id' 2>/dev/null || true)
