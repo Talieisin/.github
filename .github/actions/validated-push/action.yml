@@ -72,6 +72,7 @@ runs:
         PATCH: ${{ inputs.patch-path }}
         CREATE_BRANCH: ${{ inputs.create-branch }}
         BASE_REF: ${{ inputs.base-ref }}
+        HEAD_REF: ${{ inputs.head-ref }}
       run: |
         set -euo pipefail
         verdict_out() { echo "verdict=$1" >> "$GITHUB_OUTPUT"; echo "detail=${2:-}" >> "$GITHUB_OUTPUT"; }
