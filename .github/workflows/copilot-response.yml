@@ -280,8 +280,20 @@ jobs:
           pattern: copilot-*-${{ github.event.pull_request.number }}-${{ github.event.review.id }}
           path: ${{ runner.temp }}/in
           merge-multiple: true
+      # hashFiles() only sees the workspace, so a runner.temp path always
+      # hashes to '' — that silently skipped every response push (the
+      # verified patch was dropped, and the addressed-verdict guard then
+      # suppressed the thread reply too). Check on disk instead.
+      - name: Check for a response patch
+        id: haspatch
+        run: |
+          if [ -s "$RUNNER_TEMP/in/response.patch" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Validated push (response)
-        if: hashFiles(format('{0}/in/response.patch', runner.temp)) != ''
+        if: steps.haspatch.outputs.present == 'true'
         id: vpush
         uses: Talieisin/.github/.github/actions/validated-push@main
         with:
