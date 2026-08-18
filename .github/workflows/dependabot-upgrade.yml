@@ -1088,6 +1088,11 @@ jobs:
           SHA: ${{ needs.push2.outputs.new-sha || needs.push.outputs.new-sha }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Org Actions variable, comma-separated logins. When set, reaching
+          # ai-complete requests these users' review — GitHub then emails
+          # them and lists the PR at github.com/pulls/review-requested,
+          # which becomes the ready-to-merge inbox. Empty = skip.
+          MERGE_REVIEWERS: ${{ vars.AI_MERGE_REVIEWERS }}
         run: |
           set -euo pipefail
           case "$OUTCOME" in
@@ -1099,6 +1104,16 @@ jobs:
           esac
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-queued 2>/dev/null || true
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label "$label" || true
+          if [ "$label" = "ai-complete" ] && [ -n "${MERGE_REVIEWERS:-}" ]; then
+            args=()
+            while read -r r; do
+              [ -n "$r" ] && args+=(-f "reviewers[]=$r")
+            done < <(printf '%s' "$MERGE_REVIEWERS" | tr ',' '\n' | tr -d ' ')
+            if [ "${#args[@]}" -gt 0 ]; then
+              gh api -X POST "repos/$REPO/pulls/$PR_NUMBER/requested_reviewers" "${args[@]}" > /dev/null \
+                || echo "review request failed (non-fatal)"
+            fi
+          fi
           cid=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
                 --jq '[.[] | select((.user.login == "'"$APP_SLUG"'[bot]") and (.body | startswith("'"$STICKY_MARKER"'")))][0].id' 2>/dev/null || true)
           if [ -n "$cid" ] && [ "$cid" != "null" ]; then
