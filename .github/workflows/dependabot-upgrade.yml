@@ -938,23 +938,17 @@ jobs:
           set -euo pipefail
           SUMMARY="$RUNNER_TEMP/revision/summary.json"
 
-          append_sticky() { # $1 = markdown to append; never fatal
-            cid=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
-                  --jq '[.[] | select((.user.login == "'"$APP_SLUG"'[bot]") and (.body | startswith("'"$STICKY_MARKER"'")))][0].id' 2>/dev/null || true)
-            if [ -n "$cid" ] && [ "$cid" != "null" ]; then
-              existing=$(gh api "repos/$REPO/issues/comments/$cid" --jq .body)
-              gh api -X PATCH "repos/$REPO/issues/comments/$cid" -f body="$existing
-
-          ---
-          $1" > /dev/null || echo "warning: sticky append failed"
-            else
-              gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="${STICKY_MARKER}
-          $1" > /dev/null || echo "warning: sticky create failed"
-            fi
+          # A NEW comment, not a sticky amend: the response reads
+          # chronologically next to the Codex review it answers, instead of
+          # being buried inside the ever-growing status comment (same
+          # treatment as the Copilot-review response).
+          post_comment() { # $1 = markdown body; never fatal
+            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$1" > /dev/null \
+              || echo "warning: disposition comment failed"
           }
 
           render_disposition() {
-            jq -r '"### Reviewer-round disposition\n\n"
+            jq -r '"### Response to the Codex review\n\n"
               + (if (.findings | length) > 0
                  then ([.findings[] | "- **" + .id + "** — " + (.verdict | gsub("_"; " ")) + ": " + .note] | join("\n"))
                  else "(no per-finding verdicts recorded)" end)
@@ -993,18 +987,18 @@ jobs:
 
           case "$PRE_VERDICT" in
             missing)
-              append_sticky "### Reviewer-round disposition
+              post_comment "### Response to the Codex review
 
           The revision round produced no artifact (job failure) — treat the Codex findings above as UNVERIFIED and review them manually. ([run]($RUN_URL))"
               echo "outcome=error" >> "$GITHUB_OUTPUT"; exit 0 ;;
             toobig)
-              append_sticky "$(render_disposition)
+              post_comment "$(render_disposition)
 
           Revision patch exceeded the size limit and was NOT pushed. ([run]($RUN_URL))"
               echo "outcome=error" >> "$GITHUB_OUTPUT"; exit 0 ;;
             none)
               close_threads nopush ""
-              append_sticky "$(render_disposition)
+              post_comment "$(render_disposition)
 
           No further code changes from the reviewer round. ([run]($RUN_URL))"
               echo "outcome=none" >> "$GITHUB_OUTPUT"; exit 0 ;;
@@ -1013,18 +1007,18 @@ jobs:
           case "$VP_OUTCOME" in
             pushed)
               close_threads all "$VP_SHA"
-              append_sticky "$(render_disposition)
+              post_comment "$(render_disposition)
 
           Revision pushed as \`$VP_SHA\`. ([run]($RUN_URL))"
               echo "outcome=pushed" >> "$GITHUB_OUTPUT" ;;
             stale)
               gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-queued || true
-              append_sticky "### Reviewer-round disposition
+              post_comment "### Response to the Codex review
 
           The branch moved during the revision round ($VP_DETAIL) — revision discarded, PR re-queued. ([run]($RUN_URL))"
               echo "outcome=stale" >> "$GITHUB_OUTPUT" ;;
             *)
-              append_sticky "$(render_disposition)
+              post_comment "$(render_disposition)
 
           Revision was NOT pushed ($VP_OUTCOME: $VP_DETAIL) — review the findings manually. ([run]($RUN_URL))"
               echo "outcome=error" >> "$GITHUB_OUTPUT" ;;
