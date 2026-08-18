@@ -15,6 +15,14 @@ name: Claude command
 #
 # v1 is research/answer only — it never modifies code. Use the Dependabot
 # pipeline (or a human) for changes.
+#
+# Accepted residuals (Codex-reviewed; same posture as the upgrade
+# pipeline's agent job, see the internal ai-automation doc): the OAuth
+# token is readable by the agent process (blast radius: subscription
+# abuse, not repo compromise); a repo-level AI_COMMAND_USERS variable
+# would override the org one, and workflow reruns are available to users
+# with write access — both moot in a one-seat org where the sole listed
+# commenter is also the only human with write anywhere.
 
 on:
   workflow_call:
@@ -31,8 +39,11 @@ on:
       TALIEISIN_AUTOMATION_APP_PRIVATE_KEY:
         required: true
 
+# Per-comment group: comment ids are unique, so a spammed unauthorised
+# comment can never evict a queued authorised run from a shared group —
+# each run stands alone and unauthorised ones die at the gate in seconds.
 concurrency:
-  group: claude-command-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
+  group: claude-command-${{ github.repository }}-${{ github.event.comment.id }}
   cancel-in-progress: false
 
 env:
@@ -161,11 +172,12 @@ jobs:
             concise, under 500 words unless the question demands more.
           claude_args: >-
             --model ${{ inputs.model }}
+            --max-turns 40
             --allowedTools "Read,Glob,Grep,WebFetch,WebSearch,Bash(gh:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(jq:*)"
             --json-schema '{
               "type": "object",
               "properties": {
-                "answer": {"type": "string"}
+                "answer": {"type": "string", "maxLength": 60000}
               },
               "required": ["answer"]
             }'
@@ -205,7 +217,9 @@ jobs:
             body="The @claude command failed before producing an answer — see the [run]($RUN_URL)."
           fi
           # Cap at 60KB so a runaway answer cannot hit the comment limit.
-          body=$(printf '%s' "$body" | head -c 60000)
+          # Bash substring, not a head pipeline: SIGPIPE under pipefail
+          # would fail the post instead of truncating.
+          body=${body:0:60000}
           footer="${ANSWER_MARKER}"
           if [ "$IS_REVIEW" = "true" ]; then
             printf '%s\n\n%s' "$body" "$footer" | gh api -X POST "repos/$REPO/pulls/$NUMBER/comments/$CID/replies" -F body=@- > /dev/null
