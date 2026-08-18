@@ -258,6 +258,12 @@ jobs:
                  no_changes_needed=true (put the evidence in the summary
                  fields) — that is a successful outcome, not a failure.
             6. Finish by emitting the structured summary (schema provided).
+               FORMATTING: every string field is rendered verbatim in a
+               GitHub comment. Write them as Markdown BULLET LISTS — one
+               finding/change/result per `- ` bullet, key terms in bold,
+               identifiers and versions in backticks. Never emit a single
+               paragraph longer than two sentences; structure must be
+               visible at a glance, like a good reviewer's summary.
           claude_args: >-
             --model ${{ inputs.model }}
             --allowedTools "Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(pnpm:*),Bash(corepack:*),Bash(yarn:*),Bash(uv:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(cargo:*),Bash(terraform:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(mkdir:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
@@ -800,6 +806,10 @@ jobs:
             addressed (you changed code), rejected (claim is wrong — say
             what you checked), or no_action_needed (claim true but no code
             change warranted — say why), and a note carrying the evidence.
+            FORMATTING: notes and any free-text fields are rendered verbatim
+            in GitHub comments — keep each note to at most two sentences,
+            bold the verdict-deciding fact, and backtick identifiers,
+            files, and versions.
           claude_args: >-
             --model ${{ inputs.model }}
             --allowedTools "Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(pnpm:*),Bash(corepack:*),Bash(yarn:*),Bash(uv:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(cargo:*),Bash(terraform:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(mkdir:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"

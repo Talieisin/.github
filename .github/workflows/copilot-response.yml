@@ -204,6 +204,10 @@ jobs:
             Constraints: no git commit/push, no comments, no gh, nothing
             under .github/ — leave edits in the working tree. Finish with the
             structured summary: one entry per finding id.
+            FORMATTING: notes and free-text fields are rendered verbatim in
+            GitHub comments — at most two sentences per note, bold the
+            verdict-deciding fact, backtick identifiers/files/versions, and
+            use `- ` bullets for anything with more than one item.
           claude_args: >-
             --model ${{ inputs.model }}
             --allowedTools "Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(pnpm:*),Bash(corepack:*),Bash(yarn:*),Bash(uv:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(cargo:*),Bash(terraform:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(mkdir:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
@@ -360,25 +364,20 @@ jobs:
             fi
           done
 
-          # Sticky append.
-          disposition=$(jq -r '"### Copilot-review response\n\n"
+          # NEW comment, not a sticky amend: burying the response inside the
+          # (already long) status comment made it easy to miss — a fresh
+          # comment reads chronologically next to Copilot's review, and the
+          # per-finding thread replies above carry the inline detail.
+          disposition=$(jq -r '"### Response to the Copilot review\n\n"
             + (if (.findings | length) > 0
-               then ([.findings[] | "- **" + .id + "** — " + (.verdict | gsub("_"; " ")) + ": " + .note] | join("\n"))
-               else "(no verdicts recorded)" end)
+               then ([.findings[] | "- **" + .id + "** — **" + (.verdict | gsub("_"; " ")) + "**: " + .note] | join("\n"))
+               else "_(no verdicts recorded)_" end)
             + "\n\n**Changes:** " + (if (.changes_made // "") == "" then "none" else .changes_made end)
             + "\n**Tests:** " + (.test_results // "-")
             + (if .error then "\n**Error:** " + .error else "" end)' "$SUMMARY" 2>/dev/null || echo "(no summary)")
-          cid=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
-                --jq '[.[] | select((.user.login == "'"$APP_SLUG"'[bot]") and (.body | startswith("'"$STICKY_MARKER"'")))][0].id' 2>/dev/null || true)
-          if [ -n "$cid" ] && [ "$cid" != "null" ]; then
-            existing=$(gh api "repos/$REPO/issues/comments/$cid" --jq .body)
-            gh api -X PATCH "repos/$REPO/issues/comments/$cid" -f body="$existing
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$disposition${VP_SHA:+
 
-          ---
-          $disposition${VP_SHA:+
-
-          Response pushed as \`$VP_SHA\`.} ([run]($RUN_URL))" > /dev/null || true
-          fi
+          Response pushed as \`$VP_SHA\`.} ([run]($RUN_URL))" > /dev/null || echo "warning: response comment failed"
           echo "pushed=$pushed" >> "$GITHUB_OUTPUT"
 
   ci-watch:
