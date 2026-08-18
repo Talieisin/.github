@@ -132,6 +132,12 @@ jobs:
       - name: Enable pnpm
         if: inputs.setup == 'pnpm'
         uses: pnpm/action-setup@v6.0.10
+        with:
+          # Same default as ci-pnpm.yml: without a version input the action
+          # requires a packageManager field in package.json and errors when
+          # the repo has none (first hit: caersid). A repo that pins an
+          # exact packageManager should keep it pnpm@10.x to match.
+          version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
         uses: astral-sh/setup-uv@v9.0.0
