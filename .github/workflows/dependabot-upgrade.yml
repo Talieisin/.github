@@ -186,15 +186,15 @@ jobs:
         id: pnpmv
         run: |
           if [ -f package.json ] && jq -e '.packageManager // empty | startswith("pnpm@")' package.json > /dev/null 2>&1; then
-            echo "from-field=true" >> "$GITHUB_OUTPUT"
+            echo "from_field=true" >> "$GITHUB_OUTPUT"
           else
-            echo "from-field=false" >> "$GITHUB_OUTPUT"
+            echo "from_field=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Enable pnpm (packageManager-pinned repo)
-        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from-field == 'true'
+        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'true'
         uses: pnpm/action-setup@v6.0.10
       - name: Enable pnpm (no packageManager field)
-        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from-field == 'false'
+        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'false'
         uses: pnpm/action-setup@v6.0.10
         with:
           version: "10"
@@ -740,15 +740,15 @@ jobs:
         id: pnpmv
         run: |
           if [ -f package.json ] && jq -e '.packageManager // empty | startswith("pnpm@")' package.json > /dev/null 2>&1; then
-            echo "from-field=true" >> "$GITHUB_OUTPUT"
+            echo "from_field=true" >> "$GITHUB_OUTPUT"
           else
-            echo "from-field=false" >> "$GITHUB_OUTPUT"
+            echo "from_field=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Enable pnpm (packageManager-pinned repo)
-        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from-field == 'true'
+        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'true'
         uses: pnpm/action-setup@v6.0.10
       - name: Enable pnpm (no packageManager field)
-        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from-field == 'false'
+        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'false'
         uses: pnpm/action-setup@v6.0.10
         with:
           version: "10"
