@@ -129,14 +129,27 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: ${{ inputs.setup-version || 'lts/*' }}
-      - name: Enable pnpm
+      # pnpm/action-setup errors BOTH ways: with no version input it
+      # requires a packageManager field (caersid crash), and with a version
+      # input it errors when the field disagrees (public-website crash,
+      # packageManager pnpm@11.x vs "10"). Auto-detect: defer to the field
+      # when present, fall back to "10" otherwise.
+      - name: Detect pnpm version source
         if: inputs.setup == 'pnpm'
+        id: pnpmv
+        run: |
+          if [ -f package.json ] && jq -e '.packageManager // empty | startswith("pnpm@")' package.json > /dev/null 2>&1; then
+            echo "from-field=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "from-field=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Enable pnpm (packageManager-pinned repo)
+        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from-field == 'true'
+        uses: pnpm/action-setup@v6.0.10
+      - name: Enable pnpm (no packageManager field)
+        if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from-field == 'false'
         uses: pnpm/action-setup@v6.0.10
         with:
-          # Same default as ci-pnpm.yml: without a version input the action
-          # requires a packageManager field in package.json and errors when
-          # the repo has none (first hit: caersid). A repo that pins an
-          # exact packageManager should keep it pnpm@10.x to match.
           version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
