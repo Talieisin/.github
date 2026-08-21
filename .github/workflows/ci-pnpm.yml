@@ -1,4 +1,13 @@
 name: CI pnpm
+
+# Actions are pinned by full commit SHA; tags are mutable.
+#
+# Runtime resolution, in order:
+# 1. If the repo has a mise.toml, mise IS the single source of truth — node
+#    and pnpm come from it (mise-action), and the version inputs are ignored.
+#    The repo's mise.toml must therefore pin BOTH node and pnpm.
+# 2. Otherwise the version inputs apply (pnpm/action-setup + setup-node).
+
 on:
   workflow_call:
     inputs:
@@ -13,20 +22,51 @@ on:
         # or pass the identical exact version.
         default: "10"
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect mise.toml
+        id: mise
+        run: echo "present=$([ -f mise.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # ── mise path: local dev and CI share one pin ──────────────────────────
+      - if: steps.mise.outputs.present == 'true'
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          install: true
+          cache: true
+
+      - name: Confirm mise supplies the toolchain
+        if: steps.mise.outputs.present == 'true'
+        run: |
+          command -v node >/dev/null || { echo "::error::mise.toml must pin node"; exit 1; }
+          command -v pnpm >/dev/null || { echo "::error::mise.toml must pin pnpm (CI takes versions from mise.toml, not workflow inputs)"; exit 1; }
+          echo "node $(node --version) / pnpm $(pnpm --version) via:"
+          mise ls --current
+
+      # ── fallback path: version inputs ──────────────────────────────────────
+      - if: steps.mise.outputs.present == 'false'
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: ${{ inputs.pnpm-version }}
       # Must stay after pnpm/action-setup: setup-node's pnpm cache resolution
       # shells out to `pnpm store path`, so pnpm has to be on PATH already.
-      - uses: actions/setup-node@v7
+      - if: steps.mise.outputs.present == 'false'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'pnpm'
+
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Detect scripts
