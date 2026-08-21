@@ -66,13 +66,22 @@ jobs:
           install: true
           cache: true
 
-      # `mise which` fails unless mise itself supplies the tool — `command -v`
-      # would accept the runner's preinstalled ambient Node.
+      # `mise which` fails unless mise's CONFIG supplies the tool (`command -v`
+      # would accept the runner's preinstalled ambient Node) — and the PATH
+      # comparison then proves the binary later steps actually execute IS the
+      # mise-provided one, not an ambient install shadowing it. realpath
+      # normalises symlinks; mise-action adds real tool paths (not shims).
       - name: Confirm mise supplies the toolchain
         if: inputs.toolchain-source == 'mise'
         run: |
-          mise which node >/dev/null || { echo "::error::mise.toml must pin node (toolchain-source: mise ignores the version inputs)"; exit 1; }
-          mise which pnpm >/dev/null || { echo "::error::mise.toml must pin pnpm (toolchain-source: mise ignores the version inputs)"; exit 1; }
+          for tool in node pnpm; do
+            from_mise=$(mise which "$tool") || { echo "::error::mise.toml must pin $tool (toolchain-source: mise ignores the version inputs)"; exit 1; }
+            from_path=$(command -v "$tool") || { echo "::error::$tool is not on PATH despite mise config"; exit 1; }
+            if [ "$(realpath "$from_path")" != "$(realpath "$from_mise")" ]; then
+              echo "::error::$tool on PATH ($from_path) is not the mise-provided binary ($from_mise) — ambient runtime is shadowing mise"
+              exit 1
+            fi
+          done
           echo "node $(node --version) / pnpm $(pnpm --version) via mise:"
           mise ls --current
 
