@@ -2,11 +2,14 @@ name: CI pnpm
 
 # Actions are pinned by full commit SHA; tags are mutable.
 #
-# Runtime resolution, in order:
-# 1. If the repo has a mise.toml, mise IS the single source of truth — node
-#    and pnpm come from it (mise-action), and the version inputs are ignored.
-#    The repo's mise.toml must therefore pin BOTH node and pnpm.
-# 2. Otherwise the version inputs apply (pnpm/action-setup + setup-node).
+# Runtime resolution is EXPLICIT, never inferred from file presence (a repo
+# can carry a mise.toml for local dev while its CI contract stays on the
+# version inputs — caersid does exactly this):
+# - toolchain-source: "inputs" (default) → pnpm/action-setup + setup-node
+#   from the version inputs, exactly as before.
+# - toolchain-source: "mise" → the repo's mise.toml is the single source of
+#   truth for BOTH node and pnpm; the version inputs are ignored and the
+#   workflow fails if mise does not supply both tools.
 
 on:
   workflow_call:
@@ -21,6 +24,10 @@ on:
         # pinning an exact pnpm should either pass "" (single source of truth)
         # or pass the identical exact version.
         default: "10"
+      toolchain-source:
+        description: '"inputs" (default) or "mise" — opt in to mise.toml as the single runtime source'
+        type: string
+        default: "inputs"
 
 permissions:
   contents: read
@@ -35,33 +42,61 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Detect mise.toml
-        id: mise
-        run: echo "present=$([ -f mise.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Validate toolchain-source
+        env:
+          SOURCE: ${{ inputs.toolchain-source }}
+        run: |
+          case "$SOURCE" in
+            inputs|mise) ;;
+            *) echo "::error::toolchain-source must be 'inputs' or 'mise', got '$SOURCE'"; exit 1 ;;
+          esac
+          if [ "$SOURCE" = "mise" ] && [ ! -f mise.toml ]; then
+            echo "::error::toolchain-source is 'mise' but the repo has no mise.toml"
+            exit 1
+          fi
 
       # ── mise path: local dev and CI share one pin ──────────────────────────
-      - if: steps.mise.outputs.present == 'true'
+      - if: inputs.toolchain-source == 'mise'
         uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
         with:
+          # Must move together: sha256 is for mise-v<version>-linux-x64.tar.zst
+          # (the asset mise-action downloads on ubuntu runners).
+          version: 2026.8.10
+          sha256: ccc3547c9ac00828f3794bfa6dfea39fbaac9b1dc8a84ed0f71df438304224bb
           install: true
           cache: true
 
+      # `mise which` fails unless mise itself supplies the tool — `command -v`
+      # would accept the runner's preinstalled ambient Node.
       - name: Confirm mise supplies the toolchain
-        if: steps.mise.outputs.present == 'true'
+        if: inputs.toolchain-source == 'mise'
         run: |
-          command -v node >/dev/null || { echo "::error::mise.toml must pin node"; exit 1; }
-          command -v pnpm >/dev/null || { echo "::error::mise.toml must pin pnpm (CI takes versions from mise.toml, not workflow inputs)"; exit 1; }
-          echo "node $(node --version) / pnpm $(pnpm --version) via:"
+          mise which node >/dev/null || { echo "::error::mise.toml must pin node (toolchain-source: mise ignores the version inputs)"; exit 1; }
+          mise which pnpm >/dev/null || { echo "::error::mise.toml must pin pnpm (toolchain-source: mise ignores the version inputs)"; exit 1; }
+          echo "node $(node --version) / pnpm $(pnpm --version) via mise:"
           mise ls --current
 
-      # ── fallback path: version inputs ──────────────────────────────────────
-      - if: steps.mise.outputs.present == 'false'
+      # mise-action caches only mise's own data dir, not the pnpm store —
+      # without this step every mise-path run redownloads all dependencies.
+      - name: Resolve pnpm store path
+        if: inputs.toolchain-source == 'mise'
+        id: pnpm-store
+        run: echo "dir=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - if: inputs.toolchain-source == 'mise'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.dir }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+
+      # ── inputs path (default): exactly the pre-existing behaviour ──────────
+      - if: inputs.toolchain-source != 'mise'
         uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         with:
           version: ${{ inputs.pnpm-version }}
       # Must stay after pnpm/action-setup: setup-node's pnpm cache resolution
       # shells out to `pnpm store path`, so pnpm has to be on PATH already.
-      - if: steps.mise.outputs.present == 'false'
+      - if: inputs.toolchain-source != 'mise'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
