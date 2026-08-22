@@ -1,6 +1,14 @@
 name: Dependabot auto-merge
 on:
   workflow_call:
+    # Declared so callers can pass these by NAME instead of `secrets: inherit`.
+    # Optional: the workflow degrades gracefully without them (fallback comment
+    # path), and inherit-style callers keep working unchanged.
+    secrets:
+      TALIEISIN_TRIGGER_APP_ID:
+        required: false
+      TALIEISIN_TRIGGER_APP_PRIVATE_KEY:
+        required: false
 
 permissions:
   contents: write
@@ -46,11 +54,27 @@ jobs:
               fi
             done < <(printf '%s\n' "$REVIEWERS" | tr ',' '\n' | tr -d ' ')
           done
+      # github-actions ecosystem bumps NEVER auto-merge, regardless of semver:
+      # consumers pin the org reusable workflows by commit SHA precisely so a
+      # new workflow version cannot reach them unreviewed — letting Dependabot's
+      # SHA-advance PRs self-approve would silently undo that. They also skip
+      # the AI upgrade queue: CI-infrastructure changes get a human.
       - name: Auto-approve and enable auto-merge
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        if: >-
+          steps.meta.outputs.update-type != 'version-update:semver-major' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions'
         run: |
           gh pr review --approve "$PR_URL"
           gh pr merge --auto --squash --delete-branch "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Note for workflow/action bumps (human review required)
+        if: >-
+          steps.meta.outputs.package-ecosystem == 'github_actions' &&
+          (github.event.action == 'opened' || github.event.action == 'reopened')
+        run: |
+          gh pr comment "$PR_URL" --body "GitHub Actions dependency bump — auto-merge deliberately skipped: changes to CI workflows/actions require human review (this is what makes SHA-pinning the org workflows meaningful)."
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +88,7 @@ jobs:
       # the PR through the dispatcher forever.
       - name: Mint trigger-app token
         id: trigger-token
-        if: steps.meta.outputs.update-type == 'version-update:semver-major' && (github.event.action == 'opened' || github.event.action == 'reopened')
+        if: steps.meta.outputs.update-type == 'version-update:semver-major' && steps.meta.outputs.package-ecosystem != 'github_actions' && (github.event.action == 'opened' || github.event.action == 'reopened')
         continue-on-error: true
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
@@ -72,7 +96,7 @@ jobs:
           private-key: ${{ secrets.TALIEISIN_TRIGGER_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
       - name: Queue for AI upgrade (major)
-        if: steps.meta.outputs.update-type == 'version-update:semver-major' && steps.trigger-token.outcome == 'success'
+        if: steps.meta.outputs.update-type == 'version-update:semver-major' && steps.meta.outputs.package-ecosystem != 'github_actions' && steps.trigger-token.outcome == 'success'
         run: |
           # Belt and braces: never re-queue a PR already in the AI lifecycle.
           existing=$(gh pr view "$PR_URL" --json labels --jq '[.labels[].name | select(startswith("ai-"))] | length')
@@ -95,7 +119,7 @@ jobs:
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ steps.trigger-token.outputs.token }}
       - name: Note for major version bumps (fallback, trigger app unavailable)
-        if: steps.meta.outputs.update-type == 'version-update:semver-major' && (github.event.action == 'opened' || github.event.action == 'reopened') && steps.trigger-token.outcome != 'success'
+        if: steps.meta.outputs.update-type == 'version-update:semver-major' && steps.meta.outputs.package-ecosystem != 'github_actions' && (github.event.action == 'opened' || github.event.action == 'reopened') && steps.trigger-token.outcome != 'success'
         run: |
           gh pr comment "$PR_URL" --body "Major version bump — left for human review (auto-merge skipped; AI upgrade trigger app not configured)."
         env:
