@@ -371,7 +371,7 @@ jobs:
       - name: Validated push (round 1)
         if: needs.gate.outputs.verdict == 'proceed' && steps.pre.outputs.verdict == 'push'
         id: vpush
-        uses: Talieisin/.github/.github/actions/validated-push@main
+        uses: Talieisin/.github/.github/actions/validated-push@fea67b6fa1fb8be048f392582ce36c45c2f2b1ff # 2026-08-22, bumped by dependabot
         with:
           token: ${{ steps.app-token.outputs.token }}
           app-slug: ${{ steps.app-token.outputs.app-slug }}
@@ -937,7 +937,7 @@ jobs:
       - name: Validated push (round 2)
         if: steps.pre.outputs.verdict == 'push'
         id: vpush
-        uses: Talieisin/.github/.github/actions/validated-push@main
+        uses: Talieisin/.github/.github/actions/validated-push@fea67b6fa1fb8be048f392582ce36c45c2f2b1ff # 2026-08-22, bumped by dependabot
         with:
           token: ${{ steps.app-token.outputs.token }}
           app-slug: ${{ steps.app-token.outputs.app-slug }}
