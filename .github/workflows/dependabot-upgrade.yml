@@ -200,7 +200,7 @@ jobs:
           version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.1
       - name: Set up Python (pip)
         if: inputs.setup == 'pip'
         uses: actions/setup-python@v7
@@ -331,7 +331,7 @@ jobs:
     steps:
       - name: Mint automation-app token (repo-scoped, no workflows permission)
         id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
@@ -626,7 +626,7 @@ jobs:
       - name: Mint codex-reviewer app token (attribution only)
         id: codex-app
         continue-on-error: true
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.TALIEISIN_CODEX_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_CODEX_APP_PRIVATE_KEY }}
@@ -754,7 +754,7 @@ jobs:
           version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.0.1
       - name: Set up Python (pip)
         if: inputs.setup == 'pip'
         uses: actions/setup-python@v7
@@ -899,7 +899,7 @@ jobs:
     steps:
       - name: Mint automation-app token (repo-scoped, no workflows permission)
         id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
@@ -1102,7 +1102,7 @@ jobs:
           echo "CI watch outcome: $outcome"
       - name: Mint automation-app token (labels/comments only)
         id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
@@ -1204,7 +1204,7 @@ jobs:
       - name: Mint automation-app token
         id: app-token
         continue-on-error: true
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
