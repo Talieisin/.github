@@ -417,6 +417,8 @@ jobs:
                  no_changes_needed=true (put the evidence in the summary
                  fields) — that is a successful outcome, not a failure.
             6. Finish by emitting the structured summary (schema provided).
+               ci_diagnosis is REQUIRED: the failure diagnosis in rescue
+               mode, the empty string in every other mode.
                FORMATTING: every string field is rendered verbatim in a
                GitHub comment. Write them as Markdown BULLET LISTS — one
                finding/change/result per `- ` bullet, key terms in bold,
@@ -453,7 +455,7 @@ jobs:
                   }
                 }
               },
-              "required": ["breaking_changes", "changes_made", "test_results", "residual_risk", "infeasible", "no_changes_needed"]
+              "required": ["breaking_changes", "changes_made", "test_results", "residual_risk", "infeasible", "no_changes_needed", "ci_diagnosis"]
             }'
       - name: Collect patch and summary
         env:
@@ -614,7 +616,10 @@ jobs:
 
           to_blocked() { # $1 = why
             gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-queued 2>/dev/null || true
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-blocked || true
+            for other in ai-complete ai-ci-failed ai-suggested; do
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
+            done
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-blocked || echo "warning: could not apply ai-blocked"
             sticky_comment "## AI upgrade: no changes pushed
 
           **Why:** $1
@@ -689,16 +694,29 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ needs.gate.outputs.head-sha }}
+          GATE_MOVED: ${{ needs.gate.outputs.moved }}
           ARTIFACT_OK: ${{ steps.artifact.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           S="$RUNNER_TEMP/ai/summary.json"
+          # Head moved during the gate: requeue (the general handler is
+          # mode-gated away from suggest, so handle it here) — parking
+          # would demand a human for what a fresh run fixes itself.
+          if [ "$GATE_MOVED" = "true" ]; then
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-queued || true
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "AI suggest round: the PR head moved during the gate — re-queued for a fresh pass. ([run]($RUN_URL))" || true
+            echo "outcome=stale" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           gh label create ai-suggested --repo "$REPO" --color 5319E7 \
             --description "Workflow-file fix posted as suggestion blocks for a human to apply" 2>/dev/null || true
           park() {
             gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-queued 2>/dev/null || true
-            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-blocked || true
+            for other in ai-complete ai-ci-failed ai-suggested; do
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
+            done
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-blocked || echo "warning: could not apply ai-blocked"
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "AI suggest round produced nothing usable: $1 ([run]($RUN_URL))" || true
             echo "outcome=blocked" >> "$GITHUB_OUTPUT"
             exit 0
@@ -773,7 +791,10 @@ jobs:
               || park "could not deliver the analysis comment"
           fi
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-queued 2>/dev/null || true
-          gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-suggested || true
+          for other in ai-complete ai-ci-failed ai-blocked; do
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
+          done
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-suggested || echo "warning: could not apply ai-suggested"
           echo "suggest round done: $count suggestion(s), delivery=$posted"
           echo "outcome=suggested" >> "$GITHUB_OUTPUT"
 
@@ -1385,10 +1406,13 @@ jobs:
 
   ci-watch:
     needs: [gate, push, push2]
+    # push2 'error' excluded too (Codex 2026-09-04): a refused round-2
+    # push must not let the round-1 SHA be validated as complete while a
+    # reviewer revision sits unpushed — the finalize job parks it instead.
     if: >-
       always() && needs.gate.outputs.verdict == 'proceed' &&
       (needs.push.outputs.outcome == 'pushed' || needs.push.outputs.outcome == 'nochange') &&
-      needs.push2.outputs.outcome != 'stale'
+      needs.push2.outputs.outcome != 'stale' && needs.push2.outputs.outcome != 'error'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -1422,8 +1446,9 @@ jobs:
           sts='[]'
           while [ "$(date +%s)" -lt "$deadline" ]; do
             sleep 30
-            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
-                   --jq "[.check_runs[] | select(.check_suite.id != $own_suite)]")
+            runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+                   --jq "[.check_runs[] | select(.check_suite.id != $own_suite)]" \
+                   | jq -s 'add // []')
             # Legacy commit statuses count too (paginated raw endpoint,
             # latest per context — the combined endpoint truncates at 30).
             sts=$(gh api "repos/$REPO/commits/$SHA/statuses?per_page=100" --paginate --jq '.' \
@@ -1501,9 +1526,11 @@ jobs:
           # would make the verdict about the wrong commit.
           if [ -n "${SHA:-}" ]; then
             current=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid || echo "")
-            if [ -n "$current" ] && [ "$current" != "$SHA" ]; then
+            # Fail CLOSED: an unreadable live head is as disqualifying as a
+            # moved one — ai-complete must never rest on an unverified head.
+            if [ -z "$current" ] || [ "$current" != "$SHA" ]; then
               label=ai-blocked
-              msg="The PR head moved after the pipeline's final push (\`$SHA\` → \`$current\`) — nothing this run verified describes the current commit. Review by hand or re-queue with \`ai-queued\`."
+              msg="The PR head could not be verified to still be \`$SHA\` (moved, or the lookup failed) — nothing this run verified describes the current commit. Review by hand or re-queue with \`ai-queued\`."
             fi
           fi
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-queued 2>/dev/null || true
