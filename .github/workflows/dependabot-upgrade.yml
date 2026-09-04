@@ -78,11 +78,14 @@ jobs:
       contents: read
       pull-requests: read
       checks: read # rescue mode: red-head / green-base verification
+      statuses: read # rescue mode: legacy commit-status comparison
       actions: read # rescue mode: excluding this run's own check suite
     outputs:
       verdict: ${{ steps.checks.outputs.verdict }}
       reason: ${{ steps.checks.outputs.reason }}
       mode: ${{ steps.checks.outputs.mode }}
+      moved: ${{ steps.freshen.outputs.moved }}
+      failing-keys: ${{ steps.checks.outputs.failing-keys }}
       head-sha: ${{ steps.freshen.outputs.head-sha }}
       head-ref: ${{ github.event.pull_request.head.ref }}
       deps: ${{ steps.meta.outputs.dependency-names }}
@@ -170,7 +173,10 @@ jobs:
               local runs st
               runs=$(gh api "repos/$BASE_REPO/commits/$1/check-runs?per_page=100" --paginate \
                 --jq '.check_runs') || return 1
-              st=$(gh api "repos/$BASE_REPO/commits/$1/status" --jq '.statuses') || return 1
+              # Raw statuses endpoint, paginated, latest per context — the
+              # combined endpoint truncates at 30 contexts.
+              st=$(gh api "repos/$BASE_REPO/commits/$1/statuses?per_page=100" --paginate --jq '.' \
+                | jq -s 'add // [] | group_by(.context) | map(max_by(.created_at))') || return 1
               jq -n --argjson runs "$(jq -s 'add // []' <<<"$runs")" --argjson st "$st" --argjson own "$own_suite" '
                 ($runs | map(select(.check_suite.id != $own))) as $r
                 | {
@@ -196,6 +202,10 @@ jobs:
             redmain=$(jq -r --argjson f "$failing" '. as $s | [$f[] | ($s.checks[.] // "MISSING") | select(. != "MISSING" and . != "success" and . != "skipped" and . != "neutral")] | length' <<<"$base_snap" 2>/dev/null || echo 1)
             [ "${redmain:-1}" = "0" ] || block "the base branch fails the same check(s) — repo bug, not the bump (fix main first)"
             [ "${unknown:-1}" = "0" ] || block "no trustworthy base counterpart for the failing check(s) — comparison inconclusive, not rescuing"
+            # ci-watch later requires exactly these keys to be green on
+            # the final head — a fast unrelated check must never stand in
+            # for the rescued one.
+            echo "failing-keys=$failing" >> "$GITHUB_OUTPUT"
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "verdict=proceed" >> "$GITHUB_OUTPUT"
@@ -211,21 +221,30 @@ jobs:
           VERDICT: ${{ steps.checks.outputs.verdict }}
         run: |
           set -euo pipefail
+          # The recorded head is ALWAYS the event SHA every gate check ran
+          # against. If the live head differs (Dependabot rebased or
+          # pushed mid-gate) the validation — diff allowlist, rescue
+          # red/green, metadata — no longer describes reality: emit
+          # moved=true so the run requeues instead of adopting an
+          # unvalidated head (Codex implementation review 2026-09-04).
+          echo "head-sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           if [ "$VERDICT" != "proceed" ]; then
-            echo "head-sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            echo "moved=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Rebase-by-comment is NOT attempted: Dependabot ignores commands
-          # from App accounts. A stale-but-mergeable branch is workable; the
-          # validated-push stale check protects against mid-run movement.
           behind=$(gh api "repos/$REPO/compare/$BASE_REF...$HEAD_SHA" --jq .behind_by || echo 0)
           [ "${behind:-0}" -gt 0 ] && echo "note: branch is $behind commits behind $BASE_REF"
-          HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)
-          echo "head-sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          live=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)
+          if [ "$live" != "$HEAD_SHA" ]; then
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+            echo "head moved during the gate ($HEAD_SHA -> $live) — this run will requeue"
+          else
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+          fi
 
   agent:
     needs: gate
-    if: needs.gate.outputs.verdict == 'proceed'
+    if: needs.gate.outputs.verdict == 'proceed' && needs.gate.outputs.moved != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -562,6 +581,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GATE_VERDICT: ${{ needs.gate.outputs.verdict }}
           GATE_REASON: ${{ needs.gate.outputs.reason }}
+          GATE_MOVED: ${{ needs.gate.outputs.moved }}
           MODE: ${{ needs.gate.outputs.mode }}
           DISARM_OUTCOME: ${{ steps.disarm.outcome }}
           DISARM_VERIFIED: ${{ steps.disarm.outputs.verified }}
@@ -589,7 +609,7 @@ jobs:
           }
 
           render_summary() {
-            jq -r '"**Breaking changes identified:**\n\n\(.breaking_changes // "-")\n\n**Changes made:**\n\n\(.changes_made // "-")\n\n**Test results:**\n\n\(.test_results // "-")\n\n**Residual risk:** \(.residual_risk // "unknown")\n\n**Human decisions needed:**\n\n\(.human_decisions_needed // "none")\n" + (if .error then "\n**Error:** \(.error)\n" else "" end)' "$SUMMARY" 2>/dev/null || echo "(no summary available)"
+            jq -r '"**Breaking changes identified:**\n\n\(.breaking_changes // "-")\n\n**Changes made:**\n\n\(.changes_made // "-")\n\n**Test results:**\n\n\(.test_results // "-")\n\n**Residual risk:** \(.residual_risk // "unknown")\n\n**Human decisions needed:**\n\n\(.human_decisions_needed // "none")\n" + (if (.ci_diagnosis // "") != "" then "\n**CI diagnosis (rescue):**\n\n\(.ci_diagnosis)\n" else "" end) + (if .error then "\n**Error:** \(.error)\n" else "" end)' "$SUMMARY" 2>/dev/null || echo "(no summary available)"
           }
 
           to_blocked() { # $1 = why
@@ -606,6 +626,14 @@ jobs:
           }
 
           if [ "$GATE_VERDICT" = "blocked" ]; then to_blocked "$GATE_REASON"; fi
+          if [ "$GATE_MOVED" = "true" ]; then
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-queued || true
+            sticky_comment "## AI upgrade: head moved during the gate — re-queued
+
+          The PR head changed while the gate was validating it, so nothing this run checked describes the current commit. Re-queued for a fresh run. ([run]($RUN_URL))"
+            echo "outcome=stale" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$PRE_VERDICT" = "blocked" ]; then to_blocked "$PRE_WHY"; fi
           if [ "$MODE" = "rescue" ] && [ "$DISARM_OUTCOME" = "success" ] && [ "$DISARM_VERIFIED" != "true" ]; then
             to_blocked "auto-merge could not be verifiably disarmed — a rescue push must never be mergeable-on-green mid-pipeline"
@@ -677,6 +705,15 @@ jobs:
           }
           [ "$ARTIFACT_OK" = "success" ] && [ -f "$S" ] || park "agent produced no analysis artifact"
           [ "$(jq -r .infeasible "$S")" = "false" ] || park "agent reported the analysis infeasible"
+          # Anchors were computed against the gate-validated head: if the
+          # PR moved since, requeue rather than post outdated suggestions.
+          current=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha || echo "")
+          if [ "$current" != "$HEAD_SHA" ]; then
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-queued || true
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "AI suggest round: the PR head moved while the analysis ran — re-queued for a fresh pass. ([run]($RUN_URL))" || true
+            echo "outcome=stale" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if ! files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '[.[].filename]' | jq -s 'add // []'); then
             park "could not list changed files to validate suggestion anchors"
           fi
@@ -686,6 +723,10 @@ jobs:
           # anchored to files THIS PR changes, bounded spans and sizes, and
           # no fence-breakout (a replacement containing a triple backtick
           # would escape its own suggestion block).
+          # Fence-breakout applies to EVERY agent-controlled field placed
+          # near the suggestion fence, not just the replacement (Codex:
+          # a rationale containing a fence could inject an unvalidated
+          # suggestion block).
           bad=$(jq -r --argjson files "$files" '[(.suggestions // [])[] | . as $sg
             | select(
                 (($sg.path | test("^\\.github/(workflows/[^/]+\\.ya?ml|actions/[^/]+/action\\.ya?ml)$")) | not)
@@ -693,7 +734,9 @@ jobs:
                 or ($sg.start_line < 1) or ($sg.end_line < $sg.start_line)
                 or (($sg.end_line - $sg.start_line) > 60)
                 or (($sg.replacement | length) > 6000)
-                or ($sg.replacement | contains("```")))
+                or ($sg.replacement | test("```|~~~"))
+                or (($sg.rationale | length) > 400)
+                or ($sg.rationale | test("```|~~~")))
             | $sg.path + ":" + ($sg.start_line|tostring)] | join(" ")' "$S")
           [ -z "$bad" ] || park "suggestions failed deterministic validation: $bad"
           overview=$(jq -r '"## AI analysis: GitHub-Actions major bump\n\n**Per-action verdicts:**\n\n" + (.breaking_changes // "-")
@@ -713,18 +756,21 @@ jobs:
             else
               # Anchor rejected (line outside the rendered diff): degrade to
               # a plain comment carrying the same content as fenced blocks —
-              # everything becomes hand-apply.
+              # everything becomes hand-apply. Delivery must be PROVEN: if
+              # this fails too, park — ai-suggested with nothing posted
+              # would be a silent success (Codex 2026-09-04).
               fallback=$(jq -r '([(.suggestions // [])[]
                 | "**" + .path + " lines " + (.start_line|tostring) + "-" + (.end_line|tostring) + "** [" + .tier + "] " + .rationale + "\n\n~~~yaml\n" + (.replacement | gsub("~~~"; "---")) + "\n~~~"] | join("\n\n"))' "$S")
               gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$overview
 
           Suggestion anchors were rejected by the API (lines outside the diff) — apply these by hand:
 
-          $fallback" || true
+          $fallback" || park "could not deliver the suggestions (anchored review and fallback comment both failed)"
               posted="fallback"
             fi
           else
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$overview" || true
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$overview" \
+              || park "could not deliver the analysis comment"
           fi
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-queued 2>/dev/null || true
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-suggested || true
@@ -1050,10 +1096,13 @@ jobs:
           allowed_bots: ${{ inputs.allowed-bots }}
           prompt: |
             This working tree holds the current state of a Dependabot
-            major-version upgrade PR (${{ needs.gate.outputs.deps }}
+            dependency PR (MODE: ${{ needs.gate.outputs.mode }};
+            ${{ needs.gate.outputs.deps }}
             ${{ needs.gate.outputs.prev-version }} -> ${{ needs.gate.outputs.new-version }},
             base ${{ github.event.pull_request.base.ref }}). An earlier
-            automated round may already have adapted the code.
+            automated round may already have adapted the code. In rescue
+            mode the goal is strictly a MINIMAL fix for the previously red
+            CI — keep any revision to that scope, never a refactor.
 
             An independent automated reviewer has produced findings. Read
             them (JSON: assessment, coverage, findings[] with id, severity,
@@ -1197,8 +1246,29 @@ jobs:
           if [ ! -s "$PATCH" ]; then echo "verdict=none" >> "$GITHUB_OUTPUT"; exit 0; fi
           if [ "$(wc -c < "$PATCH")" -gt 1048576 ]; then echo "verdict=toobig" >> "$GITHUB_OUTPUT"; exit 0; fi
           echo "verdict=push" >> "$GITHUB_OUTPUT"
+      # Same invariant as round 1 (Codex 2026-09-04: round 2 was the gap):
+      # a rescue commit must never land while auto-merge could be armed.
+      - name: Verify auto-merge disarmed (rescue, round 2)
+        if: steps.pre.outputs.verdict == 'push' && needs.gate.outputs.mode == 'rescue'
+        id: disarm2
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --disable-auto 2>/dev/null || true
+          armed=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.auto_merge != null' || echo true)
+          if [ "$armed" != "false" ]; then
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+            echo "auto-merge could not be verifiably disarmed — round-2 push refused"
+          else
+            echo "verified=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Validated push (round 2)
-        if: steps.pre.outputs.verdict == 'push'
+        if: >-
+          steps.pre.outputs.verdict == 'push' &&
+          (needs.gate.outputs.mode != 'rescue' || steps.disarm2.outputs.verified == 'true')
         id: vpush
         uses: Talieisin/.github/.github/actions/validated-push@fea67b6fa1fb8be048f392582ce36c45c2f2b1ff # 2026-08-22, bumped by dependabot
         with:
@@ -1323,6 +1393,7 @@ jobs:
     timeout-minutes: 45
     permissions:
       checks: read
+      statuses: read
       actions: read
     outputs:
       outcome: ${{ steps.watch.outputs.outcome }}
@@ -1333,6 +1404,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           SHA: ${{ needs.push2.outputs.new-sha || needs.push.outputs.new-sha }}
+          MODE: ${{ needs.gate.outputs.mode }}
+          FAILING_KEYS: ${{ needs.gate.outputs.failing-keys }}
         run: |
           set -euo pipefail
           if [ -z "${SHA:-}" ]; then
@@ -1345,15 +1418,23 @@ jobs:
           deadline=$(( $(date +%s) + 2400 ))
           outcome=none
           prev_sig=""
+          runs='[]'
+          sts='[]'
           while [ "$(date +%s)" -lt "$deadline" ]; do
             sleep 30
             runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
                    --jq "[.check_runs[] | select(.check_suite.id != $own_suite)]")
-            total=$(echo "$runs" | jq length)
+            # Legacy commit statuses count too (paginated raw endpoint,
+            # latest per context — the combined endpoint truncates at 30).
+            sts=$(gh api "repos/$REPO/commits/$SHA/statuses?per_page=100" --paginate --jq '.' \
+              | jq -s 'add // [] | group_by(.context) | map(max_by(.created_at))')
+            total=$(( $(echo "$runs" | jq length) + $(echo "$sts" | jq length) ))
             if [ "$total" -eq 0 ]; then outcome=none; prev_sig=""; continue; fi
-            incomplete=$(echo "$runs" | jq '[.[] | select(.status != "completed")] | length')
+            incomplete=$(( $(echo "$runs" | jq '[.[] | select(.status != "completed")] | length') \
+              + $(echo "$sts" | jq '[.[] | select(.state == "pending")] | length') ))
             [ "$incomplete" -gt 0 ] && { outcome=pending; prev_sig=""; continue; }
-            failed=$(echo "$runs" | jq '[.[] | select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length')
+            failed=$(( $(echo "$runs" | jq '[.[] | select(.conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length') \
+              + $(echo "$sts" | jq '[.[] | select(.state != "success")] | length') ))
             # Two consecutive stable all-complete observations so a workflow
             # that registers its checks late is not missed.
             sig="$total:$failed"
@@ -1361,6 +1442,20 @@ jobs:
             if [ "$failed" -gt 0 ]; then outcome=failure; else outcome=success; fi
             break
           done
+          # Rescue: success must mean the ORIGINALLY FAILING checks are
+          # green on this head — a fast unrelated check must never stand
+          # in for a rescued one that has not (re)run (Codex 2026-09-04).
+          if [ "$MODE" = "rescue" ] && [ "$outcome" = "success" ] && [ -n "${FAILING_KEYS:-}" ]; then
+            keymap=$(jq -n --argjson r "$runs" --argjson s "$sts" '
+              (($r | map({key: (((.app.id // -1)|tostring) + ":" + .name), value: (.conclusion // "unknown")}))
+               + ($s | map({key: ("-1:" + .context), value: (if .state == "success" then "success" else "failure" end)})))
+              | from_entries')
+            missing=$(jq -r --argjson f "$FAILING_KEYS" '. as $m | [$f[] | select(($m[.] // "MISSING") != "success")] | join(" ")' <<<"$keymap")
+            if [ -n "$missing" ]; then
+              echo "rescued check(s) not green on the final head: $missing"
+              outcome=failure
+            fi
+          fi
           echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
           echo "CI watch outcome: $outcome"
       - name: Mint automation-app token (labels/comments only)
@@ -1402,7 +1497,21 @@ jobs:
             none)     label=ai-blocked;   msg="No CI checks appeared for \`$SHA\` within the watch window — verify the change manually (\`ai-complete\` is reserved for CI-green)." ;;
             *)        label=ai-ci-failed; msg="CI did not finish within the watch window for \`$SHA\` — check the PR's checks tab." ;;
           esac
+          # Never label a head this run did not verify: a concurrent push
+          # would make the verdict about the wrong commit.
+          if [ -n "${SHA:-}" ]; then
+            current=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid || echo "")
+            if [ -n "$current" ] && [ "$current" != "$SHA" ]; then
+              label=ai-blocked
+              msg="The PR head moved after the pipeline's final push (\`$SHA\` → \`$current\`) — nothing this run verified describes the current commit. Review by hand or re-queue with \`ai-queued\`."
+            fi
+          fi
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-queued 2>/dev/null || true
+          # Terminal labels are mutually exclusive: a manual retry must
+          # never finish wearing two verdicts.
+          for other in ai-complete ai-ci-failed ai-blocked ai-suggested; do
+            [ "$other" = "$label" ] || gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
+          done
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label "$label" || true
           if [ "$label" = "ai-complete" ] && [ -n "${MERGE_REVIEWERS:-}" ]; then
             # One POST per reviewer: a single bad login must not poison
