@@ -1412,7 +1412,8 @@ jobs:
     if: >-
       always() && needs.gate.outputs.verdict == 'proceed' &&
       (needs.push.outputs.outcome == 'pushed' || needs.push.outputs.outcome == 'nochange') &&
-      needs.push2.outputs.outcome != 'stale' && needs.push2.outputs.outcome != 'error'
+      needs.push2.outputs.outcome != 'stale' && needs.push2.outputs.outcome != 'error' &&
+      needs.push2.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -1637,6 +1638,9 @@ jobs:
           case "$labels" in
             *,ai-upgrade,*)
               echo "ai-upgrade still present after all jobs — parking as ai-blocked"
+              for other in ai-complete ai-ci-failed ai-suggested; do
+                gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
+              done
               gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-blocked || true
               gh pr comment "$PR_NUMBER" --repo "$REPO" --body "AI upgrade run ended without reaching a terminal state (crash or infrastructure failure) — parked as \`ai-blocked\`. Re-queue with \`ai-queued\` to retry. ([run]($RUN_URL))" || true
               ;;
