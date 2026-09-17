@@ -10,6 +10,36 @@ name: CI pnpm
 # - toolchain-source: "mise" → the repo's mise.toml is the single source of
 #   truth for BOTH node and pnpm; the version inputs are ignored and the
 #   workflow fails if mise does not supply both tools.
+#
+# Supply-chain release-age gate (job "supply-chain", no opt-out input — an
+# off switch would itself be the bypass). pnpm 11's built-in 24h age gate is
+# NON-strict: when a range only matches too-new versions it installs them and
+# silently appends to minimumReleaseAgeExclude. Every pnpm repo must therefore
+# carry, in pnpm-workspace.yaml:
+#   minimumReleaseAge: 1440        (integer minutes, >= MIN_RELEASE_AGE below)
+#   minimumReleaseAgeStrict: true
+# and the job FAILS on:
+# - either setting missing, lower, or not the right type
+# - dangerouslyAllowAllBuilds: true (workspace file or package.json "pnpm")
+# - release-age / allow-all-builds keys in .npmrc or package.json "pnpm"
+#   (the workspace file is the one place these live)
+# - pnpm_config_*/npm_config_* env or --config.* CLI overrides of those
+#   settings in any tracked non-markdown file
+# - a minimumReleaseAgeExclude entry without a valid exception (below)
+# It WARNS (annotation, never fails) on pull requests that change
+# allowBuilds, onlyBuiltDependencies, overrides, patchedDependencies or
+# packageExtensions, so a reviewer looks at them deliberately.
+#
+# Exceptions — for a genuinely urgent too-new version (e.g. a CVE fix released
+# today). Add the exact version to minimumReleaseAgeExclude AND list it in
+# .github/supply-chain-exceptions.yml, reviewed in the same PR:
+#   minimumReleaseAgeExclude:
+#     - package: "@scope/name@1.2.3"   # exact version only, no ranges
+#       reason: "GHSA-xxxx-xxxx-xxxx fix, released today"
+#       approved-by: some-github-login
+#       expires: 2026-09-24             # YYYY-MM-DD, at most 7 days ahead
+# An expired exception fails the job, which forces the exclusion's removal
+# once the version has aged past the gate anyway.
 
 on:
   workflow_call:
@@ -136,3 +166,147 @@ jobs:
       - name: Test
         if: steps.scripts.outputs.has_test == 'true'
         run: pnpm test
+
+  # Policy and exception format: see the header comment. Static config check
+  # only — no install, so it reports even when the test job fails, and does
+  # not depend on whether a frozen-lockfile install re-checks release ages.
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check pnpm release-age gate
+        env:
+          MIN_RELEASE_AGE: "1440"
+          MAX_EXCEPTION_DAYS: "7"
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          WS=pnpm-workspace.yaml
+          EX=.github/supply-chain-exceptions.yml
+          SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
+          failed=0
+          # Annotation text must stay single-line; both helpers also feed the job summary.
+          # shellcheck disable=SC2016  # the backticks are literal markdown, not expansions
+          err()  { echo "::error file=$1::$2";   printf -- '- ❌ `%s`: %s\n' "$1" "$2" >> "$SUMMARY"; failed=1; }
+          # shellcheck disable=SC2016
+          warn() { echo "::warning file=$1::$2"; printf -- '- ⚠️ `%s`: %s\n' "$1" "$2" >> "$SUMMARY"; }
+
+          # mikefarah yq (preinstalled on ubuntu-latest); the python yq has different syntax.
+          yq --version | grep -q mikefarah || { echo "::error::mikefarah yq v4 is required"; exit 1; }
+
+          echo "### pnpm supply-chain check" >> "$SUMMARY"
+
+          # ── 1. The gate itself ─────────────────────────────────────────────
+          if [ ! -f "$WS" ]; then
+            err "$WS" "missing: it must set minimumReleaseAge: $MIN_RELEASE_AGE and minimumReleaseAgeStrict: true"
+          else
+            age_tag=$(yq '.minimumReleaseAge | tag' "$WS")
+            age=$(yq '.minimumReleaseAge' "$WS")
+            if [ "$age_tag" != "!!int" ]; then
+              err "$WS" "minimumReleaseAge must be set explicitly as an integer number of minutes >= $MIN_RELEASE_AGE (got: $age)"
+            elif [ "$age" -lt "$MIN_RELEASE_AGE" ]; then
+              err "$WS" "minimumReleaseAge is $age; the org minimum is $MIN_RELEASE_AGE"
+            fi
+            strict=$(yq '.minimumReleaseAgeStrict | tag + ":" + (. | tostring)' "$WS")
+            if [ "$strict" != "!!bool:true" ]; then
+              err "$WS" "minimumReleaseAgeStrict must be explicitly true, so too-new versions fail the install instead of being silently excluded"
+            fi
+            if [ "$(yq '.dangerouslyAllowAllBuilds == true' "$WS")" = "true" ]; then
+              err "$WS" "dangerouslyAllowAllBuilds: true is not allowed; list packages in allowBuilds instead"
+            fi
+          fi
+
+          # ── 2. The gate must not be overridden elsewhere ──────────────────
+          key_re='^[[:space:]]*(minimum-?release-?age|dangerously-?allow-?all-?builds)'
+          if [ -f .npmrc ] && grep -Eiq "$key_re" .npmrc; then
+            err .npmrc "release-age / allow-all-builds settings belong only in $WS: $(grep -Ei "$key_re" .npmrc | tr '\n' ' ')"
+          fi
+          if [ -f package.json ]; then
+            pj_keys=$(jq -r '(.pnpm // {}) | keys[] | select(test("^(minimumReleaseAge|dangerouslyAllowAllBuilds)"))' package.json)
+            if [ -n "$pj_keys" ]; then
+              err package.json "\"pnpm\" field sets $(echo "$pj_keys" | tr '\n' ' ')— these belong only in $WS"
+            fi
+          fi
+          override_re='(pnpm|npm)_config_(minimum_release_age|dangerously_allow_all_builds)|--(config\.)?(minimum-release-age|minimumreleaseage|dangerously-allow-all-builds|dangerouslyallowallbuilds)'
+          while IFS= read -r hit; do
+            [ -n "$hit" ] || continue
+            err "${hit%%:*}" "overrides the release-age gate via env var or CLI flag: ${hit#*:}"
+          done < <(git grep -I -n -i -E "$override_re" -- . \
+                     ':!*.md' ':!pnpm-lock.yaml' ":!$WS" ':!.npmrc' ":!$EX" || true)
+
+          # ── 3. Exclusions need a valid, unexpired exception ───────────────
+          if [ -f "$WS" ]; then
+            ex_tag=$(yq '.minimumReleaseAgeExclude | tag' "$WS")
+            case "$ex_tag" in
+              '!!null') excludes="" ;;
+              '!!seq')  excludes=$(yq '.minimumReleaseAgeExclude[]' "$WS") ;;
+              *) err "$WS" "minimumReleaseAgeExclude must be a list"; excludes="" ;;
+            esac
+            today=$(date -u +%F)
+            horizon=$(date -u -d "+$MAX_EXCEPTION_DAYS days" +%F 2>/dev/null || date -u -v+"$MAX_EXCEPTION_DAYS"d +%F)
+            exact_re='^(@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+            valid=""
+            if [ -f "$EX" ]; then
+              count=$(yq '.minimumReleaseAgeExclude // [] | length' "$EX")
+              for i in $(seq 0 $((count - 1))); do
+                pkg=$(yq ".minimumReleaseAgeExclude[$i].package // \"\"" "$EX")
+                reason=$(yq ".minimumReleaseAgeExclude[$i].reason // \"\"" "$EX")
+                approver=$(yq ".minimumReleaseAgeExclude[$i].approved-by // \"\"" "$EX")
+                expires=$(yq ".minimumReleaseAgeExclude[$i].expires // \"\"" "$EX")
+                label="exception #$((i + 1)) (${pkg:-no package})"
+                if ! printf '%s' "$pkg" | grep -Eq "$exact_re"; then
+                  err "$EX" "$label: package must be an exact name@x.y.z version"; continue
+                fi
+                if [ -z "$reason" ] || [ -z "$approver" ]; then
+                  err "$EX" "$label: reason and approved-by are required"; continue
+                fi
+                if ! printf '%s' "$expires" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+                  err "$EX" "$label: expires must be a YYYY-MM-DD date"; continue
+                fi
+                if [[ "$expires" < "$today" ]]; then
+                  err "$EX" "$label: expired on $expires; remove it and its minimumReleaseAgeExclude entry"; continue
+                fi
+                if [[ "$expires" > "$horizon" ]]; then
+                  err "$EX" "$label: expires $expires is more than $MAX_EXCEPTION_DAYS days ahead"; continue
+                fi
+                valid+="$pkg"$'\n'
+                if ! printf '%s\n' "$excludes" | grep -Fxq -- "$pkg"; then
+                  warn "$EX" "$label is not used by minimumReleaseAgeExclude; remove it"
+                fi
+              done
+            fi
+            while IFS= read -r entry; do
+              [ -n "$entry" ] || continue
+              if ! printf '%s' "$valid" | grep -Fxq -- "$entry"; then
+                err "$WS" "minimumReleaseAgeExclude entry '$entry' has no valid exception in $EX (pnpm may have added it silently)"
+              fi
+            done <<< "$excludes"
+          fi
+
+          # ── 4. PRs: flag build/override changes for deliberate review ────
+          if [[ "$EVENT_NAME" == pull_request* ]] && [ -n "$BASE_REF" ]; then
+            if git fetch --no-tags --depth=1 origin "refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" 2>/dev/null; then
+              base_ws=$(git show "origin/$BASE_REF:$WS" 2>/dev/null || echo '{}')
+              base_pj=$(git show "origin/$BASE_REF:package.json" 2>/dev/null || echo '{}')
+              head_ws=$(cat "$WS" 2>/dev/null || echo '{}')
+              head_pj=$(cat package.json 2>/dev/null || echo '{}')
+              for key in allowBuilds onlyBuiltDependencies overrides patchedDependencies packageExtensions; do
+                if [ "$(printf '%s' "$base_ws" | yq -o=json -I0 "sort_keys(..) | .$key")" != "$(printf '%s' "$head_ws" | yq -o=json -I0 "sort_keys(..) | .$key")" ]; then
+                  warn "$WS" "$key changed in this PR; review each added or changed entry deliberately"
+                fi
+                if [ "$(printf '%s' "$base_pj" | jq -cS ".pnpm.$key")" != "$(printf '%s' "$head_pj" | jq -cS ".pnpm.$key")" ]; then
+                  warn package.json "\"pnpm\".$key changed in this PR; review each added or changed entry deliberately"
+                fi
+              done
+            else
+              warn "$WS" "could not fetch base branch $BASE_REF; skipped the build/override change review"
+            fi
+          fi
+
+          if [ "$failed" -eq 0 ]; then
+            echo "- ✅ release-age gate intact (minimumReleaseAge >= $MIN_RELEASE_AGE, strict, no unapproved exclusions)" >> "$SUMMARY"
+          fi
+          exit "$failed"
