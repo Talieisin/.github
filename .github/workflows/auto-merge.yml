@@ -82,8 +82,10 @@ jobs:
           steps.meta.outputs.update-type != 'version-update:semver-major' &&
           steps.meta.outputs.package-ecosystem != 'github_actions' &&
           steps.lifecycle.outputs.active == '0'
+        # No self-approval: every repo's ruleset requires 0 approvals, so the
+        # approve was a no-op, and it is the only thing that needs the org
+        # setting "Allow GitHub Actions to create and approve pull requests".
         run: |
-          gh pr review --approve "$PR_URL"
           gh pr merge --auto --squash --delete-branch "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}

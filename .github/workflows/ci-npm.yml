@@ -15,6 +15,9 @@ on:
         type: string
         default: "npm test --if-present"
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
