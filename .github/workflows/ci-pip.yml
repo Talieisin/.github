@@ -9,6 +9,9 @@ on:
         type: string
         default: "requirements.txt"
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest

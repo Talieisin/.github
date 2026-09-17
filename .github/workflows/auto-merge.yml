@@ -77,13 +77,15 @@ jobs:
       # queue for the pipeline's SUGGEST round (analysis + suggestion blocks,
       # never an agent push — see the org runbook's scoped-apply policy);
       # non-major actions bumps stay comment-only for a human.
-      - name: Auto-approve and enable auto-merge
+      - name: Enable auto-merge
         if: >-
           steps.meta.outputs.update-type != 'version-update:semver-major' &&
           steps.meta.outputs.package-ecosystem != 'github_actions' &&
           steps.lifecycle.outputs.active == '0'
+        # No self-approval: every repo's ruleset requires 0 approvals, so the
+        # approve was a no-op, and it is the only thing that needs the org
+        # setting "Allow GitHub Actions to create and approve pull requests".
         run: |
-          gh pr review --approve "$PR_URL"
           gh pr merge --auto --squash --delete-branch "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
