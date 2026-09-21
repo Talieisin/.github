@@ -349,7 +349,7 @@ jobs:
           # ai-meta / ai-outcome markers for the model-tier report (see
           # dependabot-upgrade.yml); a pushed round's outcome is recorded
           # by ci-watch once CI has judged the response commit.
-          META="<!-- ai-meta v=1 run=$GITHUB_RUN_ID round=copilot model=$MODEL -->"
+          META="<!-- ai-meta v=1 run=$GITHUB_RUN_ID round=copilot mode=copilot model=$MODEL -->"
           marks() { # $1 = outcome, or empty for the model line only
             printf '%s\n' "$META"
             [ -z "$1" ] || printf '<!-- ai-outcome v=1 run=%s round=copilot outcome=%s -->\n' "$GITHUB_RUN_ID" "$1"

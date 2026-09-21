@@ -1373,6 +1373,7 @@ jobs:
         id: decide
         env:
           MODEL: ${{ needs.revise.outputs.model }}
+          MODE: ${{ needs.gate.outputs.mode }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -1391,7 +1392,7 @@ jobs:
           # being buried inside the ever-growing status comment (same
           # treatment as the Copilot-review response).
           post_comment() { # $1 = markdown body; never fatal. ai-meta: see round 1
-            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="${MODEL:+<!-- ai-meta v=1 run=$GITHUB_RUN_ID round=2 model=$MODEL -->
+            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="${MODEL:+<!-- ai-meta v=1 run=$GITHUB_RUN_ID round=2 mode=$MODE model=$MODEL -->
           }$1${MODEL:+
 
           <sub>Model: \`$MODEL\` (round 2)</sub>}" > /dev/null \
