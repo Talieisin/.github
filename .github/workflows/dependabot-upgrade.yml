@@ -4,13 +4,15 @@ name: Dependabot AI upgrade
 # automation runbook.
 #
 #   gate        deterministic provenance checks; records the head SHA
-#   agent       UNPRIVILEGED Claude (model input, default fable): analyses
+#   agent       UNPRIVILEGED Claude (fable in upgrade mode, opus in rescue/
+#               suggest; `model` input overrides): analyses
 #               changelogs, adapts code, runs tests; emits patch + JSON
 #               summary artifact. No credentials, no id-token.
 #   push        deterministic round-1 push via the validated-push action
 #   codex       independent read-only adversarial review of the result
 #   codex-post  posts the codex report (PR-write, deterministic)
-#   revise      UNPRIVILEGED Claude round 2: verifies each codex finding as
+#   revise      UNPRIVILEGED Claude round 2 (opus; `review-model`, then
+#               `model`, override): verifies each codex finding as
 #               an untrusted claim — fixes what is real, rejects what is not,
 #               with evidence. Emits revision patch + disposition summary.
 #   push2       deterministic round-2 push + disposition comment
@@ -36,9 +38,13 @@ on:
         type: string
         default: ""
       model:
-        description: "Claude model alias for both agent rounds (fable | opus | sonnet | full model name)"
+        description: "Model override for both agent rounds (fable | opus | sonnet | full model name); empty = per-round/per-mode defaults"
         type: string
-        default: fable
+        default: ""
+      review-model:
+        description: "Round-2 model override, takes precedence over model for round 2; empty = model, else opus"
+        type: string
+        default: ""
       allowed-bots:
         description: "Bot actors allowed to trigger the Claude steps (the trigger app slug)"
         type: string
@@ -426,7 +432,7 @@ jobs:
                paragraph longer than two sentences; structure must be
                visible at a glance, like a good reviewer's summary.
           claude_args: >-
-            --model ${{ inputs.model }}
+            --model ${{ inputs.model || (needs.gate.outputs.mode == 'upgrade' && 'fable' || 'opus') }}
             --allowedTools "Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(pnpm:*),Bash(corepack:*),Bash(yarn:*),Bash(uv:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(cargo:*),Bash(terraform:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(mkdir:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
             --json-schema '{
               "type": "object",
@@ -1170,7 +1176,7 @@ jobs:
             bold the verdict-deciding fact, and backtick identifiers,
             files, and versions.
           claude_args: >-
-            --model ${{ inputs.model }}
+            --model ${{ inputs.review-model || inputs.model || 'opus' }}
             --allowedTools "Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(pnpm:*),Bash(corepack:*),Bash(yarn:*),Bash(uv:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(cargo:*),Bash(terraform:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(mkdir:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
             --json-schema '{
               "type": "object",
