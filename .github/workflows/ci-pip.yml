@@ -8,13 +8,17 @@ on:
       requirements-file:
         type: string
         default: "requirements.txt"
+      runner:
+        description: 'Linux runs-on label for the test job, e.g. blacksmith-4vcpu-ubuntu-2404; defaults to ubuntu-latest'
+        type: string
+        default: "ubuntu-latest"
 
 permissions:
   contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
