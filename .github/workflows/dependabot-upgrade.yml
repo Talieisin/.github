@@ -1523,7 +1523,7 @@ jobs:
             OUTCOME=failure
           fi
           case "$OUTCOME" in
-            success)  label=ai-complete;  msg="CI is green on \`$SHA\` — ready for human review and merge.$([ "$MODE" = "rescue" ] && echo ' (Rescued PR: auto-merge stays off by design — the merge is yours.)')" ;;
+            success)  label=ai-complete;  msg="CI is green on \`$SHA\` — ready for human review and merge.$([ "$MODE" = "rescue" ] && echo ' (Rescued PR: auto-merge stays off by design — the merge is yours.)' || true)" ;;
             nochange) label=ai-complete;  msg="No code changes were needed (agent and reviewer rounds agree, or findings were rejected with evidence) — merge on the PR's own CI." ;;
             failure)  label=ai-ci-failed; msg="CI failed on \`$SHA\`. Review the failing checks; re-queue with \`ai-queued\` to retry." ;;
             none)     label=ai-blocked;   msg="No CI checks appeared for \`$SHA\` within the watch window — verify the change manually (\`ai-complete\` is reserved for CI-green)." ;;
