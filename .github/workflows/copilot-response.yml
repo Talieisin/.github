@@ -105,6 +105,8 @@ jobs:
     if: needs.gate.outputs.verdict == 'proceed'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      model: ${{ steps.pick.outputs.model }}
     permissions:
       contents: read
     steps:
@@ -176,6 +178,12 @@ jobs:
             cargo) cargo fetch ;;
             *) true ;;
           esac
+      # Resolved once: claude_args and the ai-meta marker both read it.
+      - name: Resolve model
+        id: pick
+        env:
+          MODEL: ${{ inputs.model }}
+        run: echo "model=$MODEL" >> "$GITHUB_OUTPUT"
       - name: Claude — verify and address Copilot findings (unprivileged)
         id: claude
         continue-on-error: true
@@ -222,7 +230,7 @@ jobs:
             verdict-deciding fact, backtick identifiers/files/versions, and
             use `- ` bullets for anything with more than one item.
           claude_args: >-
-            --model ${{ inputs.model }}
+            --model ${{ steps.pick.outputs.model }}
             --allowedTools "Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(pnpm:*),Bash(corepack:*),Bash(yarn:*),Bash(uv:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(cargo:*),Bash(terraform:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(mkdir:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
             --json-schema '{
               "type": "object",
@@ -332,11 +340,20 @@ jobs:
           VP_OUTCOME: ${{ steps.vpush.outputs.outcome }}
           VP_DETAIL: ${{ steps.vpush.outputs.detail }}
           VP_SHA: ${{ steps.vpush.outputs.new-sha }}
+          MODEL: ${{ needs.respond.outputs.model }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           SUMMARY="$RUNNER_TEMP/in/summary.json"
+          # ai-meta / ai-outcome markers for the model-tier report (see
+          # dependabot-upgrade.yml); a pushed round's outcome is recorded
+          # by ci-watch once CI has judged the response commit.
+          META="<!-- ai-meta v=1 run=$GITHUB_RUN_ID round=copilot mode=copilot model=$MODEL -->"
+          marks() { # $1 = outcome, or empty for the model line only
+            printf '%s\n' "$META"
+            [ -z "$1" ] || printf '<!-- ai-outcome v=1 run=%s round=copilot outcome=%s -->\n' "$GITHUB_RUN_ID" "$1"
+          }
           MAP="$RUNNER_TEMP/in/findings.json"
           [ -f "$SUMMARY" ] || { echo "no summary — nothing to do"; echo "pushed=false" >> "$GITHUB_OUTPUT"; exit 0; }
 
@@ -345,10 +362,12 @@ jobs:
           case "${VP_OUTCOME:-}" in
             pushed) pushed=true ;;
             stale)
-              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Copilot-response round: the branch moved while responding ($VP_DETAIL) — response discarded. Re-request a Copilot review to retry. ([run]($RUN_URL))" || true
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(marks discarded)
+          Copilot-response round: the branch moved while responding ($VP_DETAIL) — response discarded. Re-request a Copilot review to retry. ([run]($RUN_URL))" || true
               echo "pushed=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
             violation|error|closed)
-              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Copilot-response round could not push its changes ($VP_OUTCOME: $VP_DETAIL) — review the findings manually. ([run]($RUN_URL))" || true
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(marks blocked)
+          Copilot-response round could not push its changes ($VP_OUTCOME: $VP_DETAIL) — review the findings manually. ([run]($RUN_URL))" || true
               echo "pushed=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
 
@@ -388,9 +407,14 @@ jobs:
             + "\n\n**Changes:**\n\n" + (if (.changes_made // "") == "" then "none" else .changes_made end)
             + "\n\n**Tests:**\n\n" + (.test_results // "-")
             + (if .error then "\n\n**Error:** " + .error else "" end)' "$SUMMARY" 2>/dev/null || echo "(no summary)")
-          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$disposition${VP_SHA:+
+          # No push means nothing for CI to judge: the round is complete.
+          if [ "$pushed" = "true" ]; then m=$(marks ""); else m=$(marks complete); fi
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$m
+          $disposition${VP_SHA:+
 
-          Response pushed as \`$VP_SHA\`.} ([run]($RUN_URL))" > /dev/null || echo "warning: response comment failed"
+          Response pushed as \`$VP_SHA\`.} ([run]($RUN_URL))
+
+          <sub>Model: \`$MODEL\`</sub>" > /dev/null || echo "warning: response comment failed"
           echo "pushed=$pushed" >> "$GITHUB_OUTPUT"
 
   ci-watch:
@@ -448,7 +472,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$OUTCOME" = "success" ] || [ "$OUTCOME" = "none" ]; then
-            exit 0 # ai-complete stands
+            # ai-complete stands. Recorded for the model-tier report.
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "<!-- ai-outcome v=1 run=$GITHUB_RUN_ID round=copilot outcome=complete -->
+          CI is green on the Copilot-response commit \`$SHA\` — \`ai-complete\` stands." || true
+            exit 0
           fi
           gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-complete --add-label ai-ci-failed || true
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "CI failed on the Copilot-response commit \`$SHA\` — moved to \`ai-ci-failed\`. Review the failing checks." || true
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "<!-- ai-outcome v=1 run=$GITHUB_RUN_ID round=copilot outcome=ci-failed -->
+          CI failed on the Copilot-response commit \`$SHA\` — moved to \`ai-ci-failed\`. Review the failing checks." || true
