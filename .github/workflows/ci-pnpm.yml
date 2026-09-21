@@ -58,6 +58,13 @@ on:
         description: '"inputs" (default) or "mise" — opt in to mise.toml as the single runtime source'
         type: string
         default: "inputs"
+      runner:
+        # Test job only: supply-chain stays on ubuntu-latest (no install, and
+        # it relies on the image's preinstalled mikefarah yq). Must be an x64
+        # runner when toolchain-source is "mise" (see the mise-action pin).
+        description: 'runs-on label for the test job, e.g. a Blacksmith label; defaults to ubuntu-latest'
+        type: string
+        default: "ubuntu-latest"
 
 permissions:
   contents: read
@@ -68,7 +75,7 @@ defaults:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -84,6 +91,10 @@ jobs:
             echo "::error::toolchain-source is 'mise' but the repo has no mise.toml"
             exit 1
           fi
+          if [ "$SOURCE" = "mise" ] && { [ "$RUNNER_OS" != "Linux" ] || [ "$RUNNER_ARCH" != "X64" ]; }; then
+            echo "::error::toolchain-source 'mise' needs a linux x64 runner (the mise binary sha256 is linux-x64 only), got $RUNNER_OS/$RUNNER_ARCH"
+            exit 1
+          fi
 
       # ── mise path: local dev and CI share one pin ──────────────────────────
       - if: inputs.toolchain-source == 'mise'
@@ -92,8 +103,9 @@ jobs:
           # Must move together: sha256 is the hash of the EXTRACTED mise
           # binary (official SHASUMS entry for mise-v<version>-linux-x64,
           # no extension) — mise-action verifies the binary it installs,
-          # NOT the tarball it downloads. linux-x64 only; this job hardcodes
-          # ubuntu-latest, so no per-OS hash map is needed.
+          # NOT the tarball it downloads. linux-x64 only; "Validate
+          # toolchain-source" rejects any other `runner`, so no per-OS hash
+          # map is needed.
           version: 2026.8.10
           sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
           install: true

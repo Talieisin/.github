@@ -9,13 +9,17 @@ on:
       terraform-version:
         type: string
         default: "latest"
+      runner:
+        description: 'runs-on label for the test job, e.g. a Blacksmith label; defaults to ubuntu-latest'
+        type: string
+        default: "ubuntu-latest"
 
 permissions:
   contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     strategy:
       fail-fast: false
       matrix:

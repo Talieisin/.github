@@ -5,13 +5,17 @@ on:
       python-version:
         type: string
         default: "3.12"
+      runner:
+        description: 'runs-on label for the test job, e.g. a Blacksmith label; defaults to ubuntu-latest'
+        type: string
+        default: "ubuntu-latest"
 
 permissions:
   contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     steps:
       - uses: actions/checkout@v7
       # setup-uv defaults `enable-cache` to true on GitHub-hosted runners from
