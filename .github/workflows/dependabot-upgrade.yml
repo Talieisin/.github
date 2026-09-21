@@ -253,6 +253,8 @@ jobs:
     if: needs.gate.outputs.verdict == 'proceed' && needs.gate.outputs.moved != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      model: ${{ steps.pick.outputs.model }}
     permissions:
       contents: read
       actions: read # rescue: deterministic failing-log prefetch (below)
@@ -340,6 +342,13 @@ jobs:
             cargo) cargo fetch ;;
             *) true ;;
           esac
+      # The model is resolved ONCE here: claude_args and the status comment
+      # both read this output, so what is recorded is what actually ran.
+      - name: Resolve round-1 model
+        id: pick
+        env:
+          MODEL: ${{ inputs.model || (needs.gate.outputs.mode == 'upgrade' && 'fable' || 'opus') }}
+        run: echo "model=$MODEL" >> "$GITHUB_OUTPUT"
       - name: Claude — analyse and adapt (unprivileged)
         id: claude
         continue-on-error: true
@@ -432,7 +441,7 @@ jobs:
                paragraph longer than two sentences; structure must be
                visible at a glance, like a good reviewer's summary.
           claude_args: >-
-            --model ${{ inputs.model || (needs.gate.outputs.mode == 'upgrade' && 'fable' || 'opus') }}
+            --model ${{ steps.pick.outputs.model }}
             --allowedTools "Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(pnpm:*),Bash(corepack:*),Bash(yarn:*),Bash(uv:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(cargo:*),Bash(terraform:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(mkdir:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
             --json-schema '{
               "type": "object",
@@ -584,6 +593,7 @@ jobs:
         id: decide
         if: needs.gate.outputs.mode != 'suggest' || needs.gate.outputs.verdict != 'proceed'
         env:
+          MODEL: ${{ needs.agent.outputs.model }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -604,11 +614,33 @@ jobs:
           set -euo pipefail
           SUMMARY="$RUNNER_TEMP/ai/summary.json"
 
+          # ai-meta / ai-outcome: machine-readable record of the model that
+          # ran and what this run concluded, keyed by run id, read by the
+          # automation repo's model-tier report. Both stay empty when the
+          # agent never ran (gate block), so no model is claimed.
+          META=""
+          if [ -n "${MODEL:-}" ]; then
+            META="<!-- ai-meta v=1 run=$GITHUB_RUN_ID round=1 mode=$MODE model=$MODEL -->"
+          fi
+          OUTC=""
+          outcome_line() { # $1 = outcome recorded by the next sticky write
+            OUTC="${META:+<!-- ai-outcome v=1 run=$GITHUB_RUN_ID round=1 outcome=$1 -->}"
+          }
           sticky_comment() { # $1 = markdown body (marker prepended); never fatal
-            body="${STICKY_MARKER}
-          $1"
             cid=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
                   --jq '[.[] | select((.user.login == "'"$APP_SLUG"'[bot]") and (.body | startswith("'"$STICKY_MARKER"'")))][0].id' 2>/dev/null || true)
+            # A retry rewrites this comment: carry earlier runs' ai-meta /
+            # ai-outcome lines forward so their record survives.
+            hist=""
+            if [ -n "$cid" ] && [ "$cid" != "null" ]; then
+              hist=$(gh api "repos/$REPO/issues/comments/$cid" --jq .body 2>/dev/null | grep -E '^<!-- ai-(meta|outcome) ' || true)
+            fi
+            head=$(printf '%s\n%s\n%s\n' "$hist" "$META" "$OUTC" | awk 'NF && !seen[$0]++')
+            body="${STICKY_MARKER}${head:+
+          $head}
+          $1${MODEL:+
+
+          <sub>Model: \`$MODEL\` ($MODE mode)</sub>}"
             if [ -n "$cid" ] && [ "$cid" != "null" ]; then
               gh api -X PATCH "repos/$REPO/issues/comments/$cid" -f body="$body" > /dev/null || echo "warning: sticky comment update failed"
             else
@@ -626,6 +658,7 @@ jobs:
               gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
             done
             gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-blocked || echo "warning: could not apply ai-blocked"
+            outcome_line blocked
             sticky_comment "## AI upgrade: no changes pushed
 
           **Why:** $1
@@ -671,6 +704,7 @@ jobs:
               ;;
             stale)
               gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-queued || true
+              outcome_line requeued
               sticky_comment "## AI upgrade: stale head, re-queued
 
           $VP_DETAIL — the patch was discarded and the PR re-queued. ([run]($RUN_URL))"
@@ -696,6 +730,7 @@ jobs:
         if: needs.gate.outputs.verdict == 'proceed' && needs.gate.outputs.mode == 'suggest'
         id: suggest
         env:
+          MODEL: ${{ needs.agent.outputs.model }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -717,13 +752,23 @@ jobs:
           fi
           gh label create ai-suggested --repo "$REPO" --color 5319E7 \
             --description "Workflow-file fix posted as suggestion blocks for a human to apply" 2>/dev/null || true
+          # ai-meta / ai-outcome (model-tier report): built before any
+          # validation, so a parked run is still attributed to its model.
+          META=""
+          if [ -n "${MODEL:-}" ]; then
+            META="<!-- ai-meta v=1 run=$GITHUB_RUN_ID round=1 mode=suggest model=$MODEL -->"
+          fi
+          marks() { # $1 = outcome -> marker lines to prefix a comment with
+            [ -z "$META" ] || printf '%s\n<!-- ai-outcome v=1 run=%s round=1 outcome=%s -->\n' "$META" "$GITHUB_RUN_ID" "$1"
+          }
           park() {
             gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-queued 2>/dev/null || true
             for other in ai-complete ai-ci-failed ai-suggested; do
               gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
             done
             gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-blocked || echo "warning: could not apply ai-blocked"
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "AI suggest round produced nothing usable: $1 ([run]($RUN_URL))" || true
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(marks blocked)
+          AI suggest round produced nothing usable: $1 ([run]($RUN_URL))" || true
             echo "outcome=blocked" >> "$GITHUB_OUTPUT"
             exit 0
           }
@@ -734,7 +779,8 @@ jobs:
           current=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha || echo "")
           if [ "$current" != "$HEAD_SHA" ]; then
             gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-queued || true
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "AI suggest round: the PR head moved while the analysis ran — re-queued for a fresh pass. ([run]($RUN_URL))" || true
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(marks requeued)
+          AI suggest round: the PR head moved while the analysis ran — re-queued for a fresh pass. ([run]($RUN_URL))" || true
             echo "outcome=stale" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -766,6 +812,14 @@ jobs:
           overview=$(jq -r '"## AI analysis: GitHub-Actions major bump\n\n**Per-action verdicts:**\n\n" + (.breaking_changes // "-")
             + "\n\n**Test/verification notes:**\n\n" + (.test_results // "-")
             + "\n\n**Scoped-apply policy:** suggestions tagged **[apply-safe]** (version/SHA bumps, matrix values, cron strings) are fine to apply from the UI after reading the diff. Anything tagged **[hand-apply]** (run: steps, uses: sources, triggers, permissions) must be retyped after real scrutiny — applying a suggestion commits it as YOU, and the changed workflow executes immediately with org secrets on the resulting push. The reasoning text is agent-written and never substitutes for reading the diff.\n\n**Residual risk:** " + (.residual_risk // "unknown")' "$S")
+          # Delivery failure parks below, so "suggested" only ever sits on
+          # a body that was actually posted.
+          if [ -n "$META" ]; then
+            overview="$(marks suggested)
+          $overview
+
+          <sub>Model: \`$MODEL\` (suggest mode)</sub>"
+          fi
           count=$(jq '.suggestions // [] | length' "$S")
           posted="verdicts-only"
           if [ "$count" -gt 0 ]; then
@@ -1036,6 +1090,8 @@ jobs:
     if: always() && needs.codex.outputs.report == 'true' && needs.codex.outputs.findings != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      model: ${{ steps.pick.outputs.model }}
     permissions:
       contents: read
     steps:
@@ -1113,6 +1169,11 @@ jobs:
             cargo) cargo fetch ;;
             *) true ;;
           esac
+      - name: Resolve round-2 model
+        id: pick
+        env:
+          MODEL: ${{ inputs.review-model || inputs.model || 'opus' }}
+        run: echo "model=$MODEL" >> "$GITHUB_OUTPUT"
       - name: Claude — verify and address reviewer findings (unprivileged)
         id: claude
         continue-on-error: true
@@ -1176,7 +1237,7 @@ jobs:
             bold the verdict-deciding fact, and backtick identifiers,
             files, and versions.
           claude_args: >-
-            --model ${{ inputs.review-model || inputs.model || 'opus' }}
+            --model ${{ steps.pick.outputs.model }}
             --allowedTools "Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(pnpm:*),Bash(corepack:*),Bash(yarn:*),Bash(uv:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(cargo:*),Bash(terraform:*),Bash(git:*),Bash(ls:*),Bash(cat:*),Bash(grep:*),Bash(rg:*),Bash(find:*),Bash(mkdir:*),Bash(sed:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
             --json-schema '{
               "type": "object",
@@ -1311,6 +1372,7 @@ jobs:
       - name: Post disposition
         id: decide
         env:
+          MODEL: ${{ needs.revise.outputs.model }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -1328,8 +1390,11 @@ jobs:
           # chronologically next to the Codex review it answers, instead of
           # being buried inside the ever-growing status comment (same
           # treatment as the Copilot-review response).
-          post_comment() { # $1 = markdown body; never fatal
-            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$1" > /dev/null \
+          post_comment() { # $1 = markdown body; never fatal. ai-meta: see round 1
+            gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="${MODEL:+<!-- ai-meta v=1 run=$GITHUB_RUN_ID round=2 model=$MODEL -->
+          }$1${MODEL:+
+
+          <sub>Model: \`$MODEL\` (round 2)</sub>}" > /dev/null \
               || echo "warning: disposition comment failed"
           }
 
@@ -1399,7 +1464,8 @@ jobs:
               echo "outcome=pushed" >> "$GITHUB_OUTPUT" ;;
             stale)
               gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-queued || true
-              post_comment "### Response to the Codex review
+              post_comment "<!-- ai-outcome v=1 run=$GITHUB_RUN_ID round=1 outcome=requeued -->
+          ### Response to the Codex review
 
           The branch moved during the revision round ($VP_DETAIL) — revision discarded, PR re-queued. ([run]($RUN_URL))"
               echo "outcome=stale" >> "$GITHUB_OUTPUT" ;;
@@ -1556,6 +1622,9 @@ jobs:
                 || echo "review request for $r failed (non-fatal)"
             done < <(printf '%s\n' "$MERGE_REVIEWERS" | tr ',' '\n' | tr -d ' ')
           fi
+          # ai-outcome (model-tier report): this run's verdict, recorded now
+          # because the label can change later for unrelated reasons.
+          OUTC="<!-- ai-outcome v=1 run=$GITHUB_RUN_ID round=1 outcome=${label#ai-} -->"
           cid=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
                 --jq '[.[] | select((.user.login == "'"$APP_SLUG"'[bot]") and (.body | startswith("'"$STICKY_MARKER"'")))][0].id' 2>/dev/null || true)
           if [ -n "$cid" ] && [ "$cid" != "null" ]; then
@@ -1563,9 +1632,11 @@ jobs:
             gh api -X PATCH "repos/$REPO/issues/comments/$cid" -f body="$existing
 
           ---
+          $OUTC
           **Final outcome:** $msg ([watch run]($RUN_URL))" > /dev/null
           else
             gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="${STICKY_MARKER}
+          $OUTC
           **Final outcome:** $msg ([watch run]($RUN_URL))" > /dev/null
           fi
 
@@ -1648,7 +1719,8 @@ jobs:
                 gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
               done
               gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ai-upgrade --add-label ai-blocked || true
-              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "AI upgrade run ended without reaching a terminal state (crash or infrastructure failure) — parked as \`ai-blocked\`. Re-queue with \`ai-queued\` to retry. ([run]($RUN_URL))" || true
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body "<!-- ai-outcome v=1 run=$GITHUB_RUN_ID round=1 outcome=blocked -->
+          AI upgrade run ended without reaching a terminal state (crash or infrastructure failure) — parked as \`ai-blocked\`. Re-queue with \`ai-queued\` to retry. ([run]($RUN_URL))" || true
               ;;
             *) exit 0 ;;
           esac
