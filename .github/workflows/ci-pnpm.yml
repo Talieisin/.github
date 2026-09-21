@@ -4,7 +4,7 @@ name: CI pnpm
 #
 # Runtime resolution is EXPLICIT, never inferred from file presence (a repo
 # can carry a mise.toml for local dev while its CI contract stays on the
-# version inputs — caersid does exactly this):
+# version inputs):
 # - toolchain-source: "inputs" (default) → pnpm/action-setup + setup-node
 #   from the version inputs, exactly as before.
 # - toolchain-source: "mise" → the repo's mise.toml is the single source of
