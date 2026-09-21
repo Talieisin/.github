@@ -10,7 +10,7 @@ on:
         type: string
         default: "latest"
       runner:
-        description: 'runs-on label for the test job, e.g. a Blacksmith label; defaults to ubuntu-latest'
+        description: 'runs-on label for the test job, e.g. blacksmith-4vcpu-ubuntu-2404; defaults to ubuntu-latest'
         type: string
         default: "ubuntu-latest"
 

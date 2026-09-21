@@ -62,7 +62,7 @@ on:
         # Test job only: supply-chain stays on ubuntu-latest (no install, and
         # it relies on the image's preinstalled mikefarah yq). Must be an x64
         # runner when toolchain-source is "mise" (see the mise-action pin).
-        description: 'runs-on label for the test job, e.g. a Blacksmith label; defaults to ubuntu-latest'
+        description: 'runs-on label for the test job, e.g. blacksmith-4vcpu-ubuntu-2404; defaults to ubuntu-latest'
         type: string
         default: "ubuntu-latest"
 
