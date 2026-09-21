@@ -20,9 +20,9 @@ on:
         type: string
         default: ""
       model:
-        description: "Claude model alias (fable | opus | sonnet | full name)"
+        description: "Claude model alias (sonnet | opus | fable | full name); sonnet suits verifying minor findings on an already-green PR"
         type: string
-        default: fable
+        default: sonnet
       allowed-bots:
         description: "Bot actors allowed to trigger the Claude step"
         type: string
