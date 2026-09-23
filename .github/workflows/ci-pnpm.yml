@@ -156,6 +156,24 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: 'pnpm'
 
+      # Next.js build cache: from Next 16, `next build` keeps Turbopack's
+      # build cache in .next/cache, so restoring it makes builds start warm.
+      # Root-level Next apps only; one in a subdirectory or with a custom
+      # distDir simply gets no cache. The key hashes every checked-out file,
+      # not just source extensions: actions/cache never overwrites an exact
+      # key, so a tsconfig/JSON/MDX/asset-only change must move it too, or
+      # later runs keep restoring the stale entry. Must stay BEFORE Install
+      # so the hash sees only the checkout. A new key restores from the
+      # newest entry for the same lockfile (Next's documented pattern). Arch
+      # is in the key because the cache holds native Turbopack artefacts.
+      - name: Next.js build cache
+        if: hashFiles('next.config.js', 'next.config.mjs', 'next.config.cjs', 'next.config.ts', 'next.config.mts') != ''
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .next/cache
+          key: nextjs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('**', '!.git/**', '!**/node_modules/**', '!.next/**') }}
+          restore-keys: nextjs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml') }}-
+
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Detect scripts
