@@ -150,6 +150,15 @@ jobs:
             > findings.json
           n=$(jq length findings.json)
           [ "$n" -gt 0 ] || skip "review has no inline comments — nothing to respond to"
+          # Also answered if the automation app already replied to any of
+          # this review's inline comments: push-response posts those replies
+          # BEFORE the marked summary comment, whose write is best-effort.
+          gh api "repos/$BASE_REPO/pulls/$PR_NUMBER/comments?per_page=100" --paginate \
+            --jq ".[] | select(.user.login == \"$AUTOMATION_BOT\") | .in_reply_to_id // empty" > own-replies.txt
+          jq -r '.[].comment_id' findings.json > finding-ids.txt
+          if grep -Fxqf finding-ids.txt own-replies.txt; then
+            skip "review $REVIEW_ID already has replies from $AUTOMATION_BOT (its summary comment is missing)"
+          fi
           mkdir -p out && cp findings.json out/findings.json
           echo "verdict=proceed" >> "$GITHUB_OUTPUT"
           echo "findings=$n" >> "$GITHUB_OUTPUT"
