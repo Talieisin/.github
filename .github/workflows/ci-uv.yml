@@ -45,11 +45,13 @@ jobs:
           LINT: ${{ inputs.lint }}
         run: |
           if [ "$LINT" = "true" ]; then
-            if ! uv run --no-sync ruff --version >/dev/null 2>&1; then
+            # Probe and run through the synced interpreter: a bare `ruff`
+            # would fall back to one on the runner's PATH, unpinned.
+            if ! uv run --no-sync python -c "import ruff" >/dev/null 2>&1; then
               echo "::error file=pyproject.toml::lint: true is set but ruff is not installed in the locked environment"
               exit 1
             fi
-            uv run --no-sync ruff check .
+            uv run --no-sync python -m ruff check .
           elif uv run --no-sync python -c "import ruff" 2>/dev/null || grep -q 'ruff' pyproject.toml 2>/dev/null; then
             uv run ruff check . || true
           fi
