@@ -51,9 +51,11 @@ env:
 
 jobs:
   gate:
-    # Both triggering events carry a comment; issue_comment covers issues
-    # AND PR conversation comments, pull_request_review_comment covers
-    # inline diff threads.
+    # issue_comment only: it covers issues AND PR conversation comments.
+    # Inline diff threads (pull_request_review_comment) are not supported —
+    # callers stopped subscribing at bootstrap v2, because GitHub holds every
+    # run a Copilot inline comment triggers, and a held run leaves the PR
+    # UNSTABLE. The gate refuses that event rather than guessing a target.
     if: startsWith(github.event.comment.body, '@claude')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -62,8 +64,6 @@ jobs:
       verdict: ${{ steps.check.outputs.verdict }}
       number: ${{ steps.check.outputs.number }}
       is-pr: ${{ steps.check.outputs.is-pr }}
-      comment-id: ${{ github.event.comment.id }}
-      is-review-comment: ${{ github.event_name == 'pull_request_review_comment' }}
     steps:
       - name: Authorise commenter
         id: check
@@ -71,11 +71,16 @@ jobs:
           AUTHOR: ${{ github.event.comment.user.login }}
           ASSOC: ${{ github.event.comment.author_association }}
           ALLOWED: ${{ vars.AI_COMMAND_USERS }}
-          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          NUMBER: ${{ github.event.issue.number }}
           IS_PR_ISSUE: ${{ github.event.issue.pull_request != null }}
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          if [ "$EVENT" != "issue_comment" ]; then
+            echo "verdict=deny" >> "$GITHUB_OUTPUT"
+            echo "Event $EVENT is not supported (issue_comment only) — ignoring."
+            exit 0
+          fi
           ok=false
           while read -r u; do
             [ -n "$u" ] || continue
@@ -92,7 +97,7 @@ jobs:
           {
             echo "verdict=proceed"
             echo "number=$NUMBER"
-            if [ "$EVENT" = "pull_request_review_comment" ] || [ "$IS_PR_ISSUE" = "true" ]; then
+            if [ "$IS_PR_ISSUE" = "true" ]; then
               echo "is-pr=true"
             else
               echo "is-pr=false"
@@ -114,14 +119,9 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           CID: ${{ github.event.comment.id }}
-          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = "pull_request_review_comment" ]; then
-            gh api -X POST "repos/$REPO/pulls/comments/$CID/reactions" -f content=eyes > /dev/null || true
-          else
-            gh api -X POST "repos/$REPO/issues/comments/$CID/reactions" -f content=eyes > /dev/null || true
-          fi
+          gh api -X POST "repos/$REPO/issues/comments/$CID/reactions" -f content=eyes > /dev/null || true
 
   answer:
     needs: gate
@@ -203,8 +203,6 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           NUMBER: ${{ needs.gate.outputs.number }}
-          CID: ${{ needs.gate.outputs.comment-id }}
-          IS_REVIEW: ${{ needs.gate.outputs.is-review-comment }}
           CLAUDE_OK: ${{ needs.answer.outputs.outcome }}
           SUMMARY: ${{ needs.answer.outputs.answer }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -221,9 +219,5 @@ jobs:
           # would fail the post instead of truncating.
           body=${body:0:60000}
           footer="${ANSWER_MARKER}"
-          if [ "$IS_REVIEW" = "true" ]; then
-            printf '%s\n\n%s' "$body" "$footer" | gh api -X POST "repos/$REPO/pulls/$NUMBER/comments/$CID/replies" -F body=@- > /dev/null
-          else
-            printf '%s\n\n%s' "$body" "$footer" | gh api -X POST "repos/$REPO/issues/$NUMBER/comments" -F body=@- > /dev/null
-          fi
+          printf '%s\n\n%s' "$body" "$footer" | gh api -X POST "repos/$REPO/issues/$NUMBER/comments" -F body=@- > /dev/null
           echo "Answer posted."
