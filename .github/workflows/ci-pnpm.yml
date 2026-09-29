@@ -65,6 +65,13 @@ on:
         description: 'Linux runs-on label for the test job, e.g. blacksmith-4vcpu-ubuntu-2404; defaults to ubuntu-latest'
         type: string
         default: "ubuntu-latest"
+      lint:
+        # Opt-in, never inferred from package.json: bumping the pin must not
+        # switch lint on for a repo that is not lint-clean yet. Once on, it
+        # blocks — a non-blocking lint step gets ignored.
+        description: 'Run `pnpm run lint` as a blocking step (default false). Requires a "lint" script; a repo that already lints inside its "test" script should drop it there before opting in, or it lints twice.'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -182,9 +189,24 @@ jobs:
           has_typecheck=$(jq -r 'has("scripts") and (.scripts | has("typecheck"))' package.json)
           has_build=$(jq -r 'has("scripts") and (.scripts | has("build"))' package.json)
           has_test=$(jq -r 'has("scripts") and (.scripts | has("test"))' package.json)
+          has_lint=$(jq -r 'has("scripts") and (.scripts | has("lint"))' package.json)
           echo "has_typecheck=$has_typecheck" >> "$GITHUB_OUTPUT"
           echo "has_build=$has_build" >> "$GITHUB_OUTPUT"
           echo "has_test=$has_test" >> "$GITHUB_OUTPUT"
+          echo "has_lint=$has_lint" >> "$GITHUB_OUTPUT"
+      # Cheapest gate and independent of build, so it runs first. Opted in
+      # without a lint script is a misconfiguration, not a skip: an opt-in
+      # that silently checks nothing is worse than no opt-in.
+      - name: Lint
+        if: inputs.lint
+        env:
+          HAS_LINT: ${{ steps.scripts.outputs.has_lint }}
+        run: |
+          if [ "$HAS_LINT" != "true" ]; then
+            echo "::error file=package.json::lint: true is set but package.json has no \"lint\" script"
+            exit 1
+          fi
+          pnpm run lint
       # Runs before build so a project that only wants type validation does not
       # need a no-op `build` script purely to get checked.
       - name: Typecheck
