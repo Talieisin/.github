@@ -1,9 +1,8 @@
 name: Copilot review response
 # Responds to a Copilot review on a Dependabot PR the AI upgrade pipeline
-# has already finished (label ai-complete): started by the org dispatcher
-# (v6 callers, pr-number/review-id inputs) or, for v5 callers, by the
-# held-then-released pull_request_review run. Each review is answered at
-# most once (review= in the ai-meta marker). One Claude round
+# has already finished (label ai-complete), started by the org dispatcher
+# through the caller's workflow_dispatch (pr-number/review-id inputs). Each
+# review is answered at most once (review= in the ai-meta marker). One Claude round
 # verifies each Copilot finding as an UNTRUSTED CLAIM — fixing what is real,
 # rejecting what is not, with evidence — then a deterministic job pushes via
 # the validated-push action, replies to every thread with its verdict,
@@ -30,19 +29,19 @@ on:
         description: "Bot actors allowed to trigger the Claude step"
         type: string
         default: talieisin-ai-upgrade-trigger
-      # Dispatch mode (bootstrap v6 callers): the org dispatcher starts the
-      # round via workflow_dispatch instead of the caller subscribing to
-      # pull_request_review, which GitHub holds at action_required on every
-      # PR Copilot reviews. Identifiers only — the gate re-reads the rest.
-      # Both empty = review-event mode (v5 callers).
+      # The org dispatcher starts the round via the caller's workflow_dispatch
+      # (bootstrap v6+). Callers no longer subscribe to pull_request_review:
+      # GitHub holds that run at action_required on every PR Copilot reviews,
+      # and a held run leaves the PR UNSTABLE. Identifiers only — the gate
+      # re-reads everything it judges from the API.
       pr-number:
-        description: "PR to respond on (dispatch mode); empty = take it from the pull_request_review event"
+        description: "PR to respond on"
         type: string
-        default: ""
+        required: true
       review-id:
-        description: "Copilot review to respond to (dispatch mode); empty = take it from the pull_request_review event"
+        description: "Copilot review to respond to"
         type: string
-        default: ""
+        required: true
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
@@ -52,7 +51,7 @@ on:
         required: true
 
 concurrency:
-  group: copilot-response-${{ github.repository }}-${{ inputs.pr-number || github.event.pull_request.number }}
+  group: copilot-response-${{ github.repository }}-${{ inputs.pr-number }}
   cancel-in-progress: false
 
 env:
@@ -83,22 +82,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BASE_REPO: ${{ github.repository }}
-          IN_PR: ${{ inputs.pr-number }}
-          IN_REVIEW: ${{ inputs.review-id }}
-          EVENT_PR: ${{ github.event.pull_request.number }}
-          EVENT_REVIEW: ${{ github.event.review.id }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          REVIEW_ID: ${{ inputs.review-id }}
         run: |
           set -euo pipefail
           skip() { echo "verdict=skip" >> "$GITHUB_OUTPUT"; echo "findings=0" >> "$GITHUB_OUTPUT"; echo "head-sha=" >> "$GITHUB_OUTPUT"; echo "note: $1"; exit 0; }
-          # Dispatch mode (inputs set) or review-event mode (v5 callers).
-          # Either way the inputs are identifiers only: everything the
-          # checks below judge is read back from the API, never trusted
-          # from the dispatch or the event payload.
-          if [ -n "$IN_PR$IN_REVIEW" ]; then
-            PR_NUMBER=$IN_PR REVIEW_ID=$IN_REVIEW
-          else
-            PR_NUMBER=$EVENT_PR REVIEW_ID=$EVENT_REVIEW
-          fi
+          # The inputs are identifiers only: everything the checks below
+          # judge is read back from the API, never trusted from the dispatch.
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ && "$REVIEW_ID" =~ ^[1-9][0-9]*$ ]] \
             || skip "no valid PR number and review id (pr='$PR_NUMBER' review='$REVIEW_ID')"
           echo "pr-number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
@@ -264,9 +254,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
-          # The actor of a pull_request_review event IS Copilot; a dispatched
-          # run's actor is the automation app (the org dispatcher).
-          allowed_bots: "${{ inputs.allowed-bots }},copilot-pull-request-reviewer,Copilot,github-copilot${{ inputs.review-id != '' && ',talieisin-org-automation' || '' }}"
+          # A dispatched run's actor is the automation app (the org dispatcher).
+          allowed_bots: "${{ inputs.allowed-bots }},talieisin-org-automation"
           prompt: |
             This working tree is a Dependabot dependency-upgrade PR branch
             (base ${{ needs.gate.outputs.base-ref }} in
