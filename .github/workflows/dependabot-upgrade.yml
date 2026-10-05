@@ -172,8 +172,24 @@ jobs:
             # statuses included; ANY ambiguity blocks — "unknown" is never
             # "green". Also require auto-merge provably disarmed: a rescue
             # push must not be mergeable-on-green mid-pipeline.
-            armed=$(gh api "repos/$BASE_REPO/pulls/$PR_NUMBER" --jq '.auto_merge != null' || echo true)
-            [ "$armed" = "false" ] || block "auto-merge is (or may be) armed on this PR — rescue requires it verifiably disarmed first"
+            # Read up to 4 times: one failed or empty API read must not spend
+            # the rescue's single attempt (caersid #316 did, on "unexpected
+            # end of JSON input"). Still fails closed — "unknown" blocks like
+            # "armed" — but the reason says which it was.
+            amstate=unknown
+            for i in 1 2 3 4; do
+              amstate=$(gh api "repos/$BASE_REPO/pulls/$PR_NUMBER" \
+                --jq 'if (.number | type) != "number" then "bad" elif .auto_merge == null then "off" else "armed" end') || amstate=
+              case "$amstate" in off|armed) break ;; esac
+              echo "auto-merge state read $i/4 failed (${amstate:-no output})"
+              amstate=unknown
+              [ "$i" = 4 ] || sleep $((i * 5))
+            done
+            case "$amstate" in
+              off) ;;
+              armed) block "auto-merge is armed on this PR — rescue requires it verifiably disarmed first" ;;
+              *) block "could not read this PR's auto-merge state (API error, 4 attempts) — rescue requires it verifiably disarmed, so not rescuing" ;;
+            esac
             own_suite=$(gh api "repos/$BASE_REPO/actions/runs/$GITHUB_RUN_ID" --jq .check_suite_id || echo 0)
             snapshot() { # $1 = sha -> JSON {pending: bool, checks: {"app:name": conclusion}}
               local runs st
@@ -565,13 +581,22 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          gh pr merge "$PR_NUMBER" --repo "$REPO" --disable-auto 2>/dev/null || true
-          armed=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.auto_merge != null' || echo true)
-          if [ "$armed" != "false" ]; then
-            echo "verified=false" >> "$GITHUB_OUTPUT"
-            echo "auto-merge could not be verifiably disarmed — refusing to push"
-          else
+          # Up to 4 disable-and-read attempts, so a transient API error
+          # doesn't refuse the push (see the gate); still fails closed.
+          for i in 1 2 3 4; do
+            gh pr merge "$PR_NUMBER" --repo "$REPO" --disable-auto 2>/dev/null || true
+            amstate=$(gh api "repos/$REPO/pulls/$PR_NUMBER" \
+              --jq 'if (.number | type) != "number" then "bad" elif .auto_merge == null then "off" else "armed" end') || amstate=
+            case "$amstate" in off) break ;; armed) ;; *) amstate=unknown ;; esac
+            echo "auto-merge disarm attempt $i/4: $amstate"
+            [ "$i" = 4 ] || sleep $((i * 5))
+          done
+          echo "state=$amstate" >> "$GITHUB_OUTPUT"
+          if [ "$amstate" = "off" ]; then
             echo "verified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+            echo "auto-merge could not be verifiably disarmed ($amstate) — refusing to push"
           fi
       - name: Validated push (round 1)
         if: >-
@@ -603,6 +628,7 @@ jobs:
           MODE: ${{ needs.gate.outputs.mode }}
           DISARM_OUTCOME: ${{ steps.disarm.outcome }}
           DISARM_VERIFIED: ${{ steps.disarm.outputs.verified }}
+          DISARM_STATE: ${{ steps.disarm.outputs.state }}
           PRE_VERDICT: ${{ steps.pre.outputs.verdict }}
           PRE_WHY: ${{ steps.pre.outputs.why }}
           VP_OUTCOME: ${{ steps.vpush.outputs.outcome }}
@@ -680,7 +706,10 @@ jobs:
           fi
           if [ "$PRE_VERDICT" = "blocked" ]; then to_blocked "$PRE_WHY"; fi
           if [ "$MODE" = "rescue" ] && [ "$DISARM_OUTCOME" = "success" ] && [ "$DISARM_VERIFIED" != "true" ]; then
-            to_blocked "auto-merge could not be verifiably disarmed — a rescue push must never be mergeable-on-green mid-pipeline"
+            if [ "$DISARM_STATE" = "armed" ]; then
+              to_blocked "auto-merge stayed armed through 4 disable attempts — a rescue push must never be mergeable-on-green mid-pipeline"
+            fi
+            to_blocked "could not read this PR's auto-merge state before pushing (API error, 4 attempts) — a rescue push must never be mergeable-on-green mid-pipeline"
           fi
 
           if [ "$PRE_VERDICT" = "nochange" ]; then
@@ -1345,13 +1374,19 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          gh pr merge "$PR_NUMBER" --repo "$REPO" --disable-auto 2>/dev/null || true
-          armed=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.auto_merge != null' || echo true)
-          if [ "$armed" != "false" ]; then
-            echo "verified=false" >> "$GITHUB_OUTPUT"
-            echo "auto-merge could not be verifiably disarmed — round-2 push refused"
-          else
+          for i in 1 2 3 4; do
+            gh pr merge "$PR_NUMBER" --repo "$REPO" --disable-auto 2>/dev/null || true
+            amstate=$(gh api "repos/$REPO/pulls/$PR_NUMBER" \
+              --jq 'if (.number | type) != "number" then "bad" elif .auto_merge == null then "off" else "armed" end') || amstate=
+            case "$amstate" in off) break ;; armed) ;; *) amstate=unknown ;; esac
+            echo "auto-merge disarm attempt $i/4: $amstate"
+            [ "$i" = 4 ] || sleep $((i * 5))
+          done
+          if [ "$amstate" = "off" ]; then
             echo "verified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "verified=false" >> "$GITHUB_OUTPUT"
+            echo "auto-merge could not be verifiably disarmed ($amstate) — round-2 push refused"
           fi
       - name: Validated push (round 2)
         if: >-
