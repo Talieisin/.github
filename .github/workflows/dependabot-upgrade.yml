@@ -327,15 +327,15 @@ jobs:
           fi
       - name: Enable pnpm (packageManager-pinned repo)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'true'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.0
       - name: Enable pnpm (no packageManager field)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'false'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.0
         with:
           version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.0
       - name: Set up Python (pip)
         if: inputs.setup == 'pip'
         uses: actions/setup-python@v7
@@ -965,7 +965,7 @@ jobs:
         if: steps.key.outputs.present == 'true'
         id: codex-run
         continue-on-error: true
-        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           allow-bot-users: ${{ inputs.allowed-bots }}
@@ -1167,15 +1167,15 @@ jobs:
           fi
       - name: Enable pnpm (packageManager-pinned repo)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'true'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.0
       - name: Enable pnpm (no packageManager field)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'false'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.0
         with:
           version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.0
       - name: Set up Python (pip)
         if: inputs.setup == 'pip'
         uses: actions/setup-python@v7
