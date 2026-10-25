@@ -34,7 +34,7 @@ on:
         type: string
         default: none
       setup-version:
-        description: "Toolchain version (e.g. node 24, python 3.12); empty = action default"
+        description: "Toolchain version (e.g. node 24, python 3.12); empty = action default (terraform: the repo's .terraform-version, else latest)"
         type: string
         default: ""
       model:
@@ -341,9 +341,31 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.setup-version || '3.12' }}
+      # Terraform version: an explicit setup-version wins; otherwise the
+      # caller's .terraform-version (exact X.Y.Z only, never a symlink);
+      # otherwise latest, as before. The file value is validated and never
+      # echoed; the input goes straight to the action, never to a shell.
+      - name: Resolve Terraform version
+        if: inputs.setup == 'terraform' && inputs.setup-version == ''
+        id: tfv
+        run: |
+          set -euo pipefail
+          version=latest
+          if [ -f .terraform-version ] && [ ! -L .terraform-version ]; then
+            pinned=$(head -c 64 .terraform-version | head -n 1 | tr -d '[:space:]')
+            if printf '%s' "$pinned" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              version=$pinned
+            else
+              echo "::warning::.terraform-version is not an exact X.Y.Z version; using the latest Terraform"
+            fi
+          fi
+          echo "Terraform version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Set up Terraform
         if: inputs.setup == 'terraform'
         uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ inputs.setup-version || steps.tfv.outputs.version }}
       - name: Install dependencies (best effort)
         continue-on-error: true
         env:
@@ -1181,9 +1203,31 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.setup-version || '3.12' }}
+      # Terraform version: an explicit setup-version wins; otherwise the
+      # caller's .terraform-version (exact X.Y.Z only, never a symlink);
+      # otherwise latest, as before. The file value is validated and never
+      # echoed; the input goes straight to the action, never to a shell.
+      - name: Resolve Terraform version
+        if: inputs.setup == 'terraform' && inputs.setup-version == ''
+        id: tfv
+        run: |
+          set -euo pipefail
+          version=latest
+          if [ -f .terraform-version ] && [ ! -L .terraform-version ]; then
+            pinned=$(head -c 64 .terraform-version | head -n 1 | tr -d '[:space:]')
+            if printf '%s' "$pinned" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              version=$pinned
+            else
+              echo "::warning::.terraform-version is not an exact X.Y.Z version; using the latest Terraform"
+            fi
+          fi
+          echo "Terraform version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Set up Terraform
         if: inputs.setup == 'terraform'
         uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ inputs.setup-version || steps.tfv.outputs.version }}
       - name: Install dependencies (best effort)
         continue-on-error: true
         env:
