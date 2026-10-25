@@ -7,8 +7,9 @@ on:
         description: 'JSON array of terraform directories'
         default: '["."]'
       terraform-version:
+        description: "Terraform version; empty = the repo's .terraform-version (exact X.Y.Z), else latest"
         type: string
-        default: "latest"
+        default: ""
       runner:
         description: 'Linux runs-on label for the test job, e.g. blacksmith-4vcpu-ubuntu-2404; defaults to ubuntu-latest'
         type: string
@@ -26,9 +27,36 @@ jobs:
         dir: ${{ fromJSON(inputs.directories) }}
     steps:
       - uses: actions/checkout@v7
+      # Terraform version: an explicit terraform-version wins; otherwise the
+      # caller's .terraform-version (exact X.Y.Z only, never a symlink);
+      # otherwise latest, as before. The raw file content is never echoed;
+      # only a validated value is. The input goes straight to the action.
+      - name: Resolve Terraform version
+        if: inputs.terraform-version == ''
+        id: tfv
+        run: |
+          set -euo pipefail
+          version=latest
+          if [ -f .terraform-version ] && [ ! -L .terraform-version ]; then
+            # Read one byte past the 64-byte budget: a first line that does
+            # not end within it is rejected whole, never cut and validated.
+            line=$(head -c 65 .terraform-version | head -n 1)
+            if [ "$(printf '%s' "$line" | wc -c)" -gt 64 ]; then
+              echo "::warning::.terraform-version's first line is longer than 64 bytes; using the latest Terraform"
+            else
+              pinned=$(printf '%s' "$line" | tr -d '[:space:]')
+              if printf '%s' "$pinned" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                version=$pinned
+              else
+                echo "::warning::.terraform-version is not an exact X.Y.Z version; using the latest Terraform"
+              fi
+            fi
+          fi
+          echo "Terraform version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: ${{ inputs.terraform-version }}
+          terraform_version: ${{ inputs.terraform-version || steps.tfv.outputs.version }}
       - name: Format check
         run: terraform fmt -check -recursive
         working-directory: ${{ matrix.dir }}
