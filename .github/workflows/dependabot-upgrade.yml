@@ -352,11 +352,18 @@ jobs:
           set -euo pipefail
           version=latest
           if [ -f .terraform-version ] && [ ! -L .terraform-version ]; then
-            pinned=$(head -c 64 .terraform-version | head -n 1 | tr -d '[:space:]')
-            if printf '%s' "$pinned" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-              version=$pinned
+            # Read one byte past the 64-byte budget: a first line that does
+            # not end within it is rejected whole, never cut and validated.
+            line=$(head -c 65 .terraform-version | head -n 1)
+            if [ "$(printf '%s' "$line" | wc -c)" -gt 64 ]; then
+              echo "::warning::.terraform-version's first line is longer than 64 bytes; using the latest Terraform"
             else
-              echo "::warning::.terraform-version is not an exact X.Y.Z version; using the latest Terraform"
+              pinned=$(printf '%s' "$line" | tr -d '[:space:]')
+              if printf '%s' "$pinned" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                version=$pinned
+              else
+                echo "::warning::.terraform-version is not an exact X.Y.Z version; using the latest Terraform"
+              fi
             fi
           fi
           echo "Terraform version: $version"
@@ -1214,11 +1221,18 @@ jobs:
           set -euo pipefail
           version=latest
           if [ -f .terraform-version ] && [ ! -L .terraform-version ]; then
-            pinned=$(head -c 64 .terraform-version | head -n 1 | tr -d '[:space:]')
-            if printf '%s' "$pinned" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-              version=$pinned
+            # Read one byte past the 64-byte budget: a first line that does
+            # not end within it is rejected whole, never cut and validated.
+            line=$(head -c 65 .terraform-version | head -n 1)
+            if [ "$(printf '%s' "$line" | wc -c)" -gt 64 ]; then
+              echo "::warning::.terraform-version's first line is longer than 64 bytes; using the latest Terraform"
             else
-              echo "::warning::.terraform-version is not an exact X.Y.Z version; using the latest Terraform"
+              pinned=$(printf '%s' "$line" | tr -d '[:space:]')
+              if printf '%s' "$pinned" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                version=$pinned
+              else
+                echo "::warning::.terraform-version is not an exact X.Y.Z version; using the latest Terraform"
+              fi
             fi
           fi
           echo "Terraform version: $version"
