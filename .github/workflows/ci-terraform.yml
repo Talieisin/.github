@@ -29,8 +29,8 @@ jobs:
       - uses: actions/checkout@v7
       # Terraform version: an explicit terraform-version wins; otherwise the
       # caller's .terraform-version (exact X.Y.Z only, never a symlink);
-      # otherwise latest, as before. The file value is validated and never
-      # echoed; the input goes straight to the action, never to a shell.
+      # otherwise latest, as before. The raw file content is never echoed;
+      # only a validated value is. The input goes straight to the action.
       - name: Resolve Terraform version
         if: inputs.terraform-version == ''
         id: tfv
