@@ -327,15 +327,15 @@ jobs:
           fi
       - name: Enable pnpm (packageManager-pinned repo)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'true'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.0
       - name: Enable pnpm (no packageManager field)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'false'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.0
         with:
           version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.2
       - name: Set up Python (pip)
         if: inputs.setup == 'pip'
         uses: actions/setup-python@v7
@@ -555,7 +555,7 @@ jobs:
     steps:
       - name: Mint automation-app token (repo-scoped, no workflows permission)
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
@@ -994,7 +994,7 @@ jobs:
         if: steps.key.outputs.present == 'true'
         id: codex-run
         continue-on-error: true
-        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           allow-bot-users: ${{ inputs.allowed-bots }}
@@ -1074,7 +1074,7 @@ jobs:
       - name: Mint codex-reviewer app token (attribution only)
         id: codex-app
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.TALIEISIN_CODEX_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_CODEX_APP_PRIVATE_KEY }}
@@ -1196,15 +1196,15 @@ jobs:
           fi
       - name: Enable pnpm (packageManager-pinned repo)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'true'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.0
       - name: Enable pnpm (no packageManager field)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'false'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.0
         with:
           version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.3.2
       - name: Set up Python (pip)
         if: inputs.setup == 'pip'
         uses: actions/setup-python@v7
@@ -1386,7 +1386,7 @@ jobs:
     steps:
       - name: Mint automation-app token (repo-scoped, no workflows permission)
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
@@ -1652,7 +1652,7 @@ jobs:
           echo "CI watch outcome: $outcome"
       - name: Mint automation-app token (labels/comments only)
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
@@ -1782,7 +1782,7 @@ jobs:
       - name: Mint automation-app token
         id: app-token
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
