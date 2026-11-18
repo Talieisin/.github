@@ -50,7 +50,9 @@ name: Terraform plan (pinned)
 #   permissions: contents read, pull-requests write, id-token write;
 #   jobs.<id>.uses: Talieisin/.github/.github/workflows/terraform-plan.yml@<SHA>
 #   with: azure-client-id, azure-tenant-id (IDs, not secrets); no secrets.
-#   Empty client or tenant ID: the plan job warns and plans nothing.
+#   Empty client or tenant ID: the plan job warns and plans nothing. Any value
+#   but the two fixed in the plan job's env fails it: the caller can switch
+#   planning on, never choose the identity.
 #
 # Inputs reach scripts only through env, never by ${{ }} inside a script.
 
@@ -58,11 +60,11 @@ on:
   workflow_call:
     inputs:
       azure-client-id:
-        description: Client ID of id-caersid-plan-prod (empty = not configured, nothing planned)
+        description: Client ID of id-caersid-plan-prod (empty = not configured, nothing planned; any other value fails)
         type: string
         default: ""
       azure-tenant-id:
-        description: Tenant ID (empty = not configured, nothing planned)
+        description: Its tenant ID (empty = not configured, nothing planned; any other value fails)
         type: string
         default: ""
       terraform-version:
@@ -249,6 +251,10 @@ jobs:
     outputs:
       body: ${{ steps.body.outputs.markdown }}
     env:
+      # The only identity this job signs in as: id-caersid-plan-prod, in
+      # Talieisin's tenant. Fixed here, never taken from the caller.
+      PLAN_CLIENT_ID: f021a221-0d35-4931-bf82-06144ff184a2
+      PLAN_TENANT_ID: 79f0cb1a-28e2-448a-858b-8d37bb32bd24
       STATE_ACCOUNT: tlsntfstate
       STATE_CONTAINER: tfstate
       PLATFORM_STATE_BLOB: caersid/platform-production.tfstate
@@ -490,14 +496,32 @@ jobs:
           if ! git diff --quiet "$BASE_SHA" HEAD -- "$tfroot/$tier/versions.tf" "$tfroot/$tier/backend.tf"; then
             refuse "this pull request changes the tier's \`versions.tf\` or \`backend.tf\` (providers and backend)."
           fi
-          if git diff --name-only "$BASE_SHA" HEAD -- "${paths[@]}" | grep -qE '\.tf\.json$|(^|/)override\.tf$|_override\.tf$'; then
-            refuse "this pull request changes a \`.tf.json\` or override file in the tier."
-          fi
-          if git diff -U0 --no-color "$BASE_SHA" HEAD -- "${paths[@]}" \
-             | grep -E '^[-+]' | grep -vE '^(\+\+\+|---) ' \
-             | grep -qE '\bprovider\b|required_providers|\bbackend\b|terraform_remote_state|metadata_host|oidc_|msi_|use_cli|use_msi|^[-+][[:space:]]*terraform[[:space:]]*\{'; then
-            refuse "this pull request changes a provider, backend or remote-state setting (or a line that names one). Those are never planned in CI."
-          fi
+          # The diff goes to files and each check reads a whole file: a
+          # `| grep -q` would stop reading at its first match, and the writer's
+          # SIGPIPE would then make the pipeline fail under pipefail, which an
+          # `if` reads as "no match" (the check would fail open).
+          names="$RUNNER_TEMP/rules-$tier-names.txt" lines="$RUNNER_TEMP/rules-$tier-diff.txt"
+          git diff --name-only "$BASE_SHA" HEAD -- "${paths[@]}" > "$names" || fail rules 2 unclassified "git diff failed"
+          git diff -U0 --no-color "$BASE_SHA" HEAD -- "${paths[@]}" > "$lines" || fail rules 2 unclassified "git diff failed"
+          rc=0
+          grep -E '\.tf\.json$|(^|/)override\.tf$|_override\.tf$' "$names" > /dev/null || rc=$?
+          case $rc in
+            0) refuse "this pull request changes a \`.tf.json\` or override file in the tier." ;;
+            1) ;;
+            *) fail rules 2 unclassified "the changed files could not be read" ;;
+          esac
+          # Changed lines only (not the +++/--- file headers). awk reads to the
+          # end and exits 0 on a match, 1 on none, 2 on an error.
+          rc=0
+          awk -v re='(^|[^A-Za-z0-9_])(provider|backend)([^A-Za-z0-9_]|$)|required_providers|terraform_remote_state|metadata_host|oidc_|msi_|use_cli|use_msi|^[-+][[:space:]]*terraform[[:space:]]*[{]' '
+            /^(\+\+\+|---) / { next }
+            /^[-+]/ && $0 ~ re { found = 1 }
+            END { exit found ? 0 : 1 }' "$lines" || rc=$?
+          case $rc in
+            0) refuse "this pull request changes a provider, backend or remote-state setting (or a line that names one). Those are never planned in CI." ;;
+            1) ;;
+            *) fail rules 2 unclassified "the diff could not be read" ;;
+          esac
 
           # 2. The backend key, allow-listed.
           want_key="caersid/$tier-production.tfstate"
@@ -602,14 +626,16 @@ jobs:
           TENANT_ID: ${{ inputs.azure-tenant-id }}
         run: |
           set -euo pipefail
-          uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
           if [ "$PLAN_PLATFORM" != true ] && [ "$PLAN_COMPUTE" != true ]; then
             state=not-needed
           elif [ -z "$CLIENT_ID" ] || [ -z "$TENANT_ID" ]; then
             echo "::warning title=Nothing planned::azure-client-id or azure-tenant-id is not set in the caller."
             state=not-configured
-          elif ! [[ $CLIENT_ID =~ $uuid && $TENANT_ID =~ $uuid ]]; then
-            echo "::error title=Nothing planned::azure-client-id and azure-tenant-id must be lower-case GUIDs."
+          elif [ "$CLIENT_ID" != "$PLAN_CLIENT_ID" ] || [ "$TENANT_ID" != "$PLAN_TENANT_ID" ]; then
+            # The caller (which a pull request can edit) may switch planning on
+            # or off, never choose the identity: only id-caersid-plan-prod in
+            # Talieisin's tenant, as fixed in this file.
+            echo "::error title=Nothing planned::azure-client-id and azure-tenant-id must be id-caersid-plan-prod's ($PLAN_CLIENT_ID) and its tenant's ($PLAN_TENANT_ID)."
             exit 1
           else
             state=planned
@@ -650,8 +676,8 @@ jobs:
       - if: steps.gate.outputs.state == 'planned'
         uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
-          client-id: ${{ inputs.azure-client-id }}
-          tenant-id: ${{ inputs.azure-tenant-id }}
+          client-id: ${{ env.PLAN_CLIENT_ID }}
+          tenant-id: ${{ env.PLAN_TENANT_ID }}
           allow-no-subscriptions: true
 
       - name: Check the plan identity
@@ -670,8 +696,8 @@ jobs:
         if: steps.check.outcome == 'success' && steps.tiers.outputs.plan_platform == 'true'
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
-          ARM_TENANT_ID: ${{ inputs.azure-tenant-id }}
+          ARM_CLIENT_ID: ${{ env.PLAN_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ env.PLAN_TENANT_ID }}
           TF_CLI_CONFIG_FILE: ${{ runner.temp }}/terraform.rc
         run: |
           rc=0
@@ -682,8 +708,8 @@ jobs:
         if: ${{ !cancelled() && steps.check.outcome == 'success' && steps.tiers.outputs.plan_compute == 'true' }}
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
-          ARM_TENANT_ID: ${{ inputs.azure-tenant-id }}
+          ARM_CLIENT_ID: ${{ env.PLAN_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ env.PLAN_TENANT_ID }}
           TF_CLI_CONFIG_FILE: ${{ runner.temp }}/terraform.rc
         run: |
           rc=0
