@@ -432,7 +432,7 @@ func load(dir string, isHead bool) (*model, error) {
 			add := func(id string, it *item) error {
 				if _, dup := m.items[id]; dup {
 					// The block type only: an id can embed string literals.
-					return fail("%s: a %s block is declared twice.", name, b.Type)
+					return fail("%s: two %s blocks share a name.", name, b.Type)
 				}
 				m.items[id] = it
 				return nil

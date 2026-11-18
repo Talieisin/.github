@@ -204,6 +204,12 @@ out=$(comment FAKE_MAIN=ffffffffffffffffffffffffffffffffffffffff)
 if grep -qF 'main moved during this run' <<<"$out" && ! grep -qF 'Planned as' <<<"$out"; then ok; else bad "comment: main moved"; echo "$out"; fi
 out=$(comment GATE=person FAKE_MAIN=ffffffffffffffffffffffffffffffffffffffff)
 if grep -qF "only George's own" <<<"$out" && ! grep -qF 'main moved' <<<"$out"; then ok; else bad "comment: a gate refusal stands"; echo "$out"; fi
+out=$(comment PLATFORM=false COMPUTE=true PLATFORM_STATE=skipped COMPUTE_STATE=ok PLATFORM_SUMMARY= COMPUTE_SUMMARY=$'#### compute tier\n\nNo changes.\n\nDrift: none found by the refresh.')
+if grep -qF 'azurerm_container_app.this' <<<"$out" && grep -qF 'Planned as' <<<"$out"; then ok; else bad "comment: the compute tier's drift note"; echo "$out"; fi
+out=$(comment PLATFORM_STATE=refused PLATFORM_SUMMARY= PLAN_RESULT=skipped PLATFORM_NOTE=$'#### platform tier\n\n**Not planned: a reason.**' FAKE_MAIN=ffffffffffffffffffffffffffffffffffffffff)
+if grep -qF 'Not planned: a reason.' <<<"$out" && ! grep -qF 'main moved' <<<"$out"; then ok; else bad "comment: a tier's refusal stands when main moved"; echo "$out"; fi
+out=$(comment STATE=not-configured PLATFORM_STATE= PLATFORM_SUMMARY= PLAN_RESULT=skipped FAKE_MAIN=ffffffffffffffffffffffffffffffffffffffff)
+if grep -qF 'caller passes no' <<<"$out" && ! grep -qF 'main moved' <<<"$out"; then ok; else bad "comment: not-configured stands when main moved"; echo "$out"; fi
 out=$(comment FAKE_HEAD=ffffffffffffffffffffffffffffffffffffffff)
 if [ -z "$out" ]; then ok; else bad "comment: a newer push writes nothing"; echo "$out"; fi
 

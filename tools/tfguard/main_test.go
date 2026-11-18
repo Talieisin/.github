@@ -328,10 +328,6 @@ func TestRefused(t *testing.T) {
 		{"a resource fed by a tainted local", "a type main does not use", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  n = \"x\"\n}\nresource \"azurerm_key_vault\" \"k\" {\n  name = local.n\n}\n")
 		}},
-		{"taint through two locals into a count", "count that references", func(t *testing.T, head string) {
-			replaceIn(t, head, "compute/storage.tf", "containers = 1", "containers = local.b")
-			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  b = local.a\n  a = length(data.azurerm_client_config.current.object_id)\n}\n")
-		}},
 		{"a for_each from a tainted local", "for_each that references", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  names = toset([data.azurerm_client_config.current.tenant_id])\n}\nresource \"azurerm_storage_container\" \"f\" {\n  for_each = local.names\n  name     = each.key\n}\n")
 		}},
@@ -341,7 +337,7 @@ func TestRefused(t *testing.T) {
 		{"core::file in a changed local", "calls file()", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  f = core::file(\"x\")\n}\n")
 		}},
-		{"an unknown block declared twice", "a action block is declared twice", func(t *testing.T, head string) {
+		{"an unknown block declared twice", "two action blocks share a name", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\naction \"x\" \"y\" {\n  link = \"https://evil.example\"\n}\naction \"x\" \"y\" {\n  link = \"https://evil.example\"\n}\n")
 		}},
 		{"an attribute at the top level", "attribute at the top level", func(t *testing.T, head string) {
@@ -403,9 +399,14 @@ func TestTemplatesFrozen(t *testing.T) {
 // block with a condition, is refused even though the head no longer has it.
 func TestRemovals(t *testing.T) {
 	cases := map[string]struct{ base, head, want string }{
-		"an import removed":      {"import {\n  to = azurerm_storage_account.this\n  id = \"x\"\n}\n", "", "import blocks"},
-		"a check removed":        {"check \"c\" {\n  assert {\n    condition     = true\n    error_message = \"x\"\n  }\n}\n", "", "check blocks"},
-		"a precondition removed": {"resource \"azurerm_storage_container\" \"p\" {\n  name = \"p\"\n  lifecycle {\n    precondition {\n      condition     = true\n      error_message = \"x\"\n    }\n  }\n}\n", "resource \"azurerm_storage_container\" \"p\" {\n  name = \"p\"\n}\n", "precondition or postcondition"},
+		"an import removed":           {"import {\n  to = azurerm_storage_account.this\n  id = \"x\"\n}\n", "", "import blocks"},
+		"a check removed":             {"check \"c\" {\n  assert {\n    condition     = true\n    error_message = \"x\"\n  }\n}\n", "", "check blocks"},
+		"a moved removed":             {"moved {\n  from = azurerm_storage_account.old\n  to   = azurerm_storage_account.this\n}\n", "", "moved blocks"},
+		"a removed removed":           {"removed {\n  from = azurerm_storage_account.old\n  lifecycle {\n    destroy = false\n  }\n}\n", "", "removed blocks"},
+		"an import changed in place":  {"import {\n  to = azurerm_storage_account.this\n  id = \"x\"\n}\n", "import {\n  to = azurerm_storage_account.this\n  id = \"y\"\n}\n", "import blocks"},
+		"a postcondition removed":     {"output \"o\" {\n  value = 1\n  postcondition {\n    condition     = true\n    error_message = \"x\"\n  }\n}\n", "output \"o\" {\n  value = 1\n}\n", "precondition or postcondition"},
+		"a conditioned block renamed": {"resource \"azurerm_storage_container\" \"p\" {\n  name = \"p\"\n  lifecycle {\n    precondition {\n      condition     = true\n      error_message = \"x\"\n    }\n  }\n}\n", "resource \"azurerm_storage_container\" \"q\" {\n  name = \"p\"\n  lifecycle {\n    precondition {\n      condition     = true\n      error_message = \"x\"\n    }\n  }\n}\n", "precondition"},
+		"a precondition removed":      {"resource \"azurerm_storage_container\" \"p\" {\n  name = \"p\"\n  lifecycle {\n    precondition {\n      condition     = true\n      error_message = \"x\"\n    }\n  }\n}\n", "resource \"azurerm_storage_container\" \"p\" {\n  name = \"p\"\n}\n", "precondition or postcondition"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -421,5 +422,28 @@ func TestRemovals(t *testing.T) {
 				t.Fatalf("want a refusal containing %q, got %v", c.want, err)
 			}
 		})
+	}
+}
+
+// The fixpoint's later passes: main already has count = local.b,
+// b = local.a and a = 1; the pull request changes only a. One pass taints
+// a; the next b; the next the resource, whose count then references a
+// tainted value.
+func TestTaintFixpoint(t *testing.T) {
+	dir := t.TempDir()
+	base, head := filepath.Join(dir, "base"), filepath.Join(dir, "head")
+	chain := "locals {\n  b = local.a\n  a = 1\n}\n\nresource \"azurerm_storage_container\" \"chained\" {\n  count = local.b\n  name  = \"chained\"\n}\n"
+	write(t, base, baseFiles)
+	write(t, head, baseFiles)
+	write(t, base, map[string]string{"compute/chain.tf": chain})
+	write(t, head, map[string]string{"compute/chain.tf": chain})
+	if msg, err := check("compute", head, base); err != nil {
+		t.Fatalf("unchanged chain: want ok, got %q, %v", msg, err)
+	}
+	write(t, head, map[string]string{"compute/chain.tf": strings.Replace(chain, "a = 1", "a = length(data.azurerm_client_config.current.object_id)", 1)})
+	_, err := check("compute", head, base)
+	var r refusal
+	if !errors.As(err, &r) || !strings.Contains(r.msg, "azurerm_storage_container.chained has a count that references") {
+		t.Fatalf("a changed a: want the chained count refused, got %v", err)
 	}
 }

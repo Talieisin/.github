@@ -881,7 +881,7 @@ jobs:
           			add := func(id string, it *item) error {
           				if _, dup := m.items[id]; dup {
           					// The block type only: an id can embed string literals.
-          					return fail("%s: a %s block is declared twice.", name, b.Type)
+          					return fail("%s: two %s blocks share a name.", name, b.Type)
           				}
           				m.items[id] = it
           				return nil
@@ -1838,7 +1838,7 @@ jobs:
               *) text=$(printf '#### %s tier\n\n**Not planned: an earlier step failed.** Read the run.' "$tier") ;;
             esac
             printf '%s\n' "$text"
-            if [ "$tier" = compute ] && [ "$st" = ready ] && [ -n "$summ" ] && ! grep -qF '**Not planned:' <<<"$summ"; then
+            if [ "$tier" = compute ] && [ "$st" = ok ] && [ -n "$summ" ] && ! grep -qF '**Not planned:' <<<"$summ"; then
               printf '\nAfter a deploy, `azurerm_container_app.this` is expected in the drift table: the deploy procedure owns the image.\n'
             fi
             printf '\n'
@@ -1889,7 +1889,13 @@ jobs:
           # A plan against a main that has since moved is out of date: say so
           # instead of publishing it (only when a tier changed and the gate
           # let the run through; a refusal stands as it is).
-          if [ "$GATE_RESULT" = success ] && [ "$GATE" = ok ] && [ -n "$MAIN_SHA" ] && { flag "$PLATFORM" || flag "$COMPUTE" || flag "$HARNESS"; }; then
+          # Only a body that publishes a plan is withheld: a refusal, a
+          # not-configured note or a tier's not-planned note stands.
+          published=false
+          for s in "$PLATFORM_SUMMARY" "$COMPUTE_SUMMARY"; do
+            if [ -n "$s" ] && ! grep -qF '**Not planned:' <<<"$s"; then published=true; fi
+          done
+          if [ "$GATE_RESULT" = success ] && [ "$GATE" = ok ] && [ -n "$MAIN_SHA" ] && [ "$published" = true ]; then
             main_now=$(gh api "repos/$REPO/commits/main" --jq '.sha')
             if [ "$main_now" != "$MAIN_SHA" ]; then
               note "**Not published: main moved during this run.** Push again (after a rebase if main changed Terraform)."
