@@ -166,6 +166,46 @@ rc=0; RUNNER_TEMP=$work GH_TOKEN=x "$work/plan-tier.sh" platform "$work/s.md" "$
 expect "plan-tier: refuses a GitHub token" 2 "$rc"
 rc=0; RUNNER_TEMP=$work ACTIONS_ID_TOKEN_REQUEST_TOKEN=x "$work/prepare-tiers.sh" > /dev/null 2>&1 || rc=$?
 expect "prepare-tiers: refuses the request variables" 2 "$rc"
+rc=0; RUNNER_TEMP=$work GH_TOKEN=x "$work/prepare-tiers.sh" > /dev/null 2>&1 || rc=$?
+expect "prepare-tiers: refuses a GitHub token" 2 "$rc"
+
+# --- The comment job ---------------------------------------------------------------
+# Runs the comment step with a fake gh: main and the head from FAKE_MAIN and
+# FAKE_HEAD, no earlier comment, and the posted body copied to posted.md.
+yq '.jobs.comment.steps[0].run' "$wf" > "$work/comment.sh"
+cat > "$fake/gh" <<'GH'
+#!/usr/bin/env bash
+args="$*"
+case $args in
+  *"-X POST"* | *"-X PATCH"*)
+    for a in "$@"; do case $a in body=@*) cp "${a#body=@}" "$FAKE_POSTED" ;; esac; done ;;
+  *commits/main*) echo "$FAKE_MAIN" ;;
+  *"/pulls/"*) echo "$FAKE_HEAD" ;;
+  *) ;;
+esac
+GH
+chmod +x "$fake/gh"
+H=0123456789abcdef0123456789abcdef01234567
+M=89abcdef0123456789abcdef0123456789abcdef
+comment() { # VAR=value ... : runs the comment step and prints what it posted
+  rm -f "$work/posted.md"
+  env -i PATH="$fake:$PATH" HOME="$HOME" RUNNER_TEMP="$work" FAKE_POSTED="$work/posted.md" FAKE_MAIN=$M FAKE_HEAD=$H \
+    REPO=Talieisin/caersid PR=1 EVENT_HEAD=$H MAIN_SHA=$M RUN_URL=https://github.com/x/runs/1 \
+    GATE_RESULT=success GATE=ok PREPARE_RESULT=success STATE=planned PLATFORM=true COMPUTE=false IDENTITY=false HARNESS=false \
+    PLATFORM_STATE=ok COMPUTE_STATE=skipped PLATFORM_NOTE= COMPUTE_NOTE= PLAN_RESULT=success \
+    PLATFORM_SUMMARY=$'#### platform tier\n\nNo changes.' COMPUTE_SUMMARY= "$@" bash "$work/comment.sh" > /dev/null 2>&1 || true
+  cat "$work/posted.md" 2> /dev/null || true
+}
+out=$(comment)
+if grep -qF 'No changes.' <<<"$out" && grep -qF 'Planned as' <<<"$out" && ! grep -qF 'earlier step failed' <<<"$out"; then ok; else bad "comment: a planned tier"; echo "$out"; fi
+out=$(comment PLATFORM_STATE=refused PLATFORM_SUMMARY= PLAN_RESULT=skipped PLATFORM_NOTE=$'#### platform tier\n\n**Not planned: a reason.**')
+if grep -qF 'Not planned: a reason.' <<<"$out" && grep -qF 'No tier was planned' <<<"$out" && ! grep -qF 'Planned as' <<<"$out"; then ok; else bad "comment: a refused tier"; echo "$out"; fi
+out=$(comment FAKE_MAIN=ffffffffffffffffffffffffffffffffffffffff)
+if grep -qF 'main moved during this run' <<<"$out" && ! grep -qF 'Planned as' <<<"$out"; then ok; else bad "comment: main moved"; echo "$out"; fi
+out=$(comment GATE=person FAKE_MAIN=ffffffffffffffffffffffffffffffffffffffff)
+if grep -qF "only George's own" <<<"$out" && ! grep -qF 'main moved' <<<"$out"; then ok; else bad "comment: a gate refusal stands"; echo "$out"; fi
+out=$(comment FAKE_HEAD=ffffffffffffffffffffffffffffffffffffffff)
+if [ -z "$out" ]; then ok; else bad "comment: a newer push writes nothing"; echo "$out"; fi
 
 # --- The workflow's shape ----------------------------------------------------------
 actions=$(yq '[.jobs[].steps[] | select(has("uses"))] | length' "$wf")

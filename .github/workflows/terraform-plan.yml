@@ -66,8 +66,10 @@ name: Terraform plan (pinned)
 # a value. Known to remain:
 #   - Terraform can read the token file (a replay is bounded by the token's
 #     lifetime and the plan identity) and the state copy;
-#   - azurerm resource types main already uses may send requests to a host
-#     their arguments name;
+#   - resource and data source types main already uses (of any provider in
+#     main's lock) may send requests to a host their arguments name;
+#   - a validation block of a variable the pull request changes can make
+#     the plan fail on a value;
 #   - plan success or failure, the failure class, which resources change,
 #     how many rows (instances) there are and which outputs change can each
 #     carry a bit from a value.
@@ -486,8 +488,12 @@ jobs:
           //     azurerm_key_vault_encrypted_value, and its type is one main already
           //     uses; nested data sources in a check block likewise;
           //   - no ephemeral, action, module, import, moved, removed, check or
-          //     unknown block, and no precondition or postcondition;
+          //     unknown block, no precondition or postcondition, and no dynamic
+          //     block whose for_each references a value;
           //   - a resource's type is one main already uses.
+          //   - Symmetrically, none of main's import, moved, removed or check blocks,
+          //     and no block of main's with a pre- or postcondition, is removed or
+          //     changed.
           package main
 
           import (
@@ -657,6 +663,33 @@ jobs:
           			}
           		}
           	}
+          	// Symmetric: a block of main's that the head drops or changes must not
+          	// be an import, moved, removed or check block, or hold a pre- or
+          	// postcondition (removing one changes what the plan can reveal).
+          	headCanon := map[string]int{}
+          	for _, it := range hm.items {
+          		headCanon[it.canon]++
+          	}
+          	baseIDs := make([]string, 0, len(bm.items))
+          	for id := range bm.items {
+          		baseIDs = append(baseIDs, id)
+          	}
+          	sort.Strings(baseIDs)
+          	for _, id := range baseIDs {
+          		it := bm.items[id]
+          		if headCanon[it.canon] > 0 {
+          			headCanon[it.canon]--
+          			continue
+          		}
+          		switch it.kind {
+          		case "import", "moved", "removed", "check":
+          			return "", refuse("the pull request removes or changes one of main's %s blocks. That is never planned in CI.", it.kind)
+          		}
+          		if hasCondition(it.node) {
+          			return "", refuse("the pull request removes or changes a block of main's that has a precondition or postcondition. That is never planned in CI.")
+          		}
+          	}
+
           	main := mainTypes{data: map[string]bool{}, resource: map[string]bool{}}
           	for _, t := range bm.dataTypes {
           		main.data[t] = true
@@ -847,7 +880,8 @@ jobs:
           			}
           			add := func(id string, it *item) error {
           				if _, dup := m.items[id]; dup {
-          					return fail("%s: %s is declared twice.", name, id)
+          					// The block type only: an id can embed string literals.
+          					return fail("%s: a %s block is declared twice.", name, b.Type)
           				}
           				m.items[id] = it
           				return nil
@@ -1065,14 +1099,19 @@ jobs:
           		}
           		switch x := n.(type) {
           		case *hclsyntax.FunctionCallExpr:
-          			if strings.Contains(x.Name, "::") {
+          			if fileFunctions[strings.TrimPrefix(x.Name, "core::")] {
+          				verr = refuse("%s calls %s(), which reads files. That is never planned in CI.", id, strings.TrimPrefix(x.Name, "core::"))
+          			} else if strings.Contains(x.Name, "::") {
           				verr = refuse("%s calls a provider-defined function. Those are never planned in CI.", id)
-          			} else if fileFunctions[x.Name] {
-          				verr = refuse("%s calls %s(), which reads files. That is never planned in CI.", id, x.Name)
           			}
           		case *hclsyntax.Block:
           			if x.Type == "precondition" || x.Type == "postcondition" {
           				verr = refuse("%s has a %s, whose outcome can depend on any value. Those are never planned in CI when the pull request changes them.", id, x.Type)
+          			}
+          			if x.Type == "dynamic" {
+          				if a, ok := x.Body.Attributes["for_each"]; ok && len(a.Expr.Variables()) > 0 {
+          					verr = refuse("%s has a dynamic block whose for_each references a value. Only literal for_each is planned in CI.", id)
+          				}
           			}
           		}
           		return nil
@@ -1119,7 +1158,7 @@ jobs:
           func callsFileFunction(b *hclsyntax.Block) bool {
           	found := false
           	hclsyntax.VisitAll(b, func(n hclsyntax.Node) hcl.Diagnostics {
-          		if f, ok := n.(*hclsyntax.FunctionCallExpr); ok && fileFunctions[f.Name] {
+          		if f, ok := n.(*hclsyntax.FunctionCallExpr); ok && fileFunctions[strings.TrimPrefix(f.Name, "core::")] {
           			found = true
           		}
           		return nil
@@ -1171,6 +1210,17 @@ jobs:
           		}
           	}
           	return nil
+          }
+
+          func hasCondition(n hclsyntax.Node) bool {
+          	found := false
+          	hclsyntax.VisitAll(n, func(x hclsyntax.Node) hcl.Diagnostics {
+          		if b, ok := x.(*hclsyntax.Block); ok && (b.Type == "precondition" || b.Type == "postcondition") {
+          			found = true
+          		}
+          		return nil
+          	})
+          	return found
           }
           GOSRC
           cd "$src"
@@ -1739,6 +1789,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      contents: read
       pull-requests: write
     steps:
       # No checkout: this job holds the token that writes to the pull request
@@ -1779,7 +1830,7 @@ jobs:
               printf '#### %s tier\n\nThis tier did not change; it is planned because the caller of the plan workflow changed.\n\n' "$tier"
             fi
             case $st in
-              ready)
+              ok)
                 if [ -n "$summ" ]; then text=$summ
                 elif [ "$PLAN_RESULT" = skipped ]; then text=$(printf '#### %s tier\n\n**Not planned: the plan job did not run.** Read the run.' "$tier")
                 else text=$(printf '#### %s tier\n\n**Not planned: the plan job did not succeed (%s).** Read the run.' "$tier" "$PLAN_RESULT"); fi ;;
@@ -1836,8 +1887,9 @@ jobs:
             fi
           fi
           # A plan against a main that has since moved is out of date: say so
-          # instead of publishing it.
-          if [ -n "$MAIN_SHA" ]; then
+          # instead of publishing it (only when a tier changed and the gate
+          # let the run through; a refusal stands as it is).
+          if [ "$GATE_RESULT" = success ] && [ "$GATE" = ok ] && [ -n "$MAIN_SHA" ] && { flag "$PLATFORM" || flag "$COMPUTE" || flag "$HARNESS"; }; then
             main_now=$(gh api "repos/$REPO/commits/main" --jq '.sha')
             if [ "$main_now" != "$MAIN_SHA" ]; then
               note "**Not published: main moved during this run.** Push again (after a rebase if main changed Terraform)."

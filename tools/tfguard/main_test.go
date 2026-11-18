@@ -159,6 +159,9 @@ func TestPlanned(t *testing.T) {
 		"an unchanged count fed by an unchanged local": func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\n# a comment only\n")
 		},
+		"a dynamic block with a literal for_each": func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_storage_container\" \"d\" {\n  name = \"d\"\n  dynamic \"x\" {\n    for_each = [\"a\"]\n    content {}\n  }\n}\n")
+		},
 		"a variable unrelated to the provider changes": func(t *testing.T, head string) {
 			appendTo(t, head, "compute/variables.tf", "\nvariable \"other\" {\n  default = \"x\"\n}\n")
 		},
@@ -325,6 +328,22 @@ func TestRefused(t *testing.T) {
 		{"a resource fed by a tainted local", "a type main does not use", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  n = \"x\"\n}\nresource \"azurerm_key_vault\" \"k\" {\n  name = local.n\n}\n")
 		}},
+		{"taint through two locals into a count", "count that references", func(t *testing.T, head string) {
+			replaceIn(t, head, "compute/storage.tf", "containers = 1", "containers = local.b")
+			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  b = local.a\n  a = length(data.azurerm_client_config.current.object_id)\n}\n")
+		}},
+		{"a for_each from a tainted local", "for_each that references", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  names = toset([data.azurerm_client_config.current.tenant_id])\n}\nresource \"azurerm_storage_container\" \"f\" {\n  for_each = local.names\n  name     = each.key\n}\n")
+		}},
+		{"a dynamic block fed by a value", "dynamic block whose for_each", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_storage_container\" \"d\" {\n  name = \"d\"\n  dynamic \"x\" {\n    for_each = [azurerm_storage_account.this.primary_access_key]\n    content {}\n  }\n}\n")
+		}},
+		{"core::file in a changed local", "calls file()", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  f = core::file(\"x\")\n}\n")
+		}},
+		{"an unknown block declared twice", "a action block is declared twice", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\naction \"x\" \"y\" {\n  link = \"https://evil.example\"\n}\naction \"x\" \"y\" {\n  link = \"https://evil.example\"\n}\n")
+		}},
 		{"an attribute at the top level", "attribute at the top level", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nx = 1\n")
 		}},
@@ -377,5 +396,30 @@ func TestTemplatesFrozen(t *testing.T) {
 	var r refusal
 	if !errors.As(err, &r) || !strings.Contains(r.msg, "files/page.tftpl differs") {
 		t.Fatalf("a changed template: want a refusal, got %v", err)
+	}
+}
+
+// Removing or changing main's import, moved, removed or check blocks, or a
+// block with a condition, is refused even though the head no longer has it.
+func TestRemovals(t *testing.T) {
+	cases := map[string]struct{ base, head, want string }{
+		"an import removed":      {"import {\n  to = azurerm_storage_account.this\n  id = \"x\"\n}\n", "", "import blocks"},
+		"a check removed":        {"check \"c\" {\n  assert {\n    condition     = true\n    error_message = \"x\"\n  }\n}\n", "", "check blocks"},
+		"a precondition removed": {"resource \"azurerm_storage_container\" \"p\" {\n  name = \"p\"\n  lifecycle {\n    precondition {\n      condition     = true\n      error_message = \"x\"\n    }\n  }\n}\n", "resource \"azurerm_storage_container\" \"p\" {\n  name = \"p\"\n}\n", "precondition or postcondition"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			base, head := filepath.Join(dir, "base"), filepath.Join(dir, "head")
+			write(t, base, baseFiles)
+			write(t, head, baseFiles)
+			write(t, base, map[string]string{"compute/extra.tf": c.base})
+			write(t, head, map[string]string{"compute/extra.tf": c.head})
+			_, err := check("compute", head, base)
+			var r refusal
+			if !errors.As(err, &r) || !strings.Contains(r.msg, c.want) {
+				t.Fatalf("want a refusal containing %q, got %v", c.want, err)
+			}
+		})
 	}
 }

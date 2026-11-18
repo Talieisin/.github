@@ -39,8 +39,12 @@
 //     azurerm_key_vault_encrypted_value, and its type is one main already
 //     uses; nested data sources in a check block likewise;
 //   - no ephemeral, action, module, import, moved, removed, check or
-//     unknown block, and no precondition or postcondition;
+//     unknown block, no precondition or postcondition, and no dynamic
+//     block whose for_each references a value;
 //   - a resource's type is one main already uses.
+//   - Symmetrically, none of main's import, moved, removed or check blocks,
+//     and no block of main's with a pre- or postcondition, is removed or
+//     changed.
 package main
 
 import (
@@ -210,6 +214,33 @@ func check(tier, headRoot, baseRoot string) (string, error) {
 			}
 		}
 	}
+	// Symmetric: a block of main's that the head drops or changes must not
+	// be an import, moved, removed or check block, or hold a pre- or
+	// postcondition (removing one changes what the plan can reveal).
+	headCanon := map[string]int{}
+	for _, it := range hm.items {
+		headCanon[it.canon]++
+	}
+	baseIDs := make([]string, 0, len(bm.items))
+	for id := range bm.items {
+		baseIDs = append(baseIDs, id)
+	}
+	sort.Strings(baseIDs)
+	for _, id := range baseIDs {
+		it := bm.items[id]
+		if headCanon[it.canon] > 0 {
+			headCanon[it.canon]--
+			continue
+		}
+		switch it.kind {
+		case "import", "moved", "removed", "check":
+			return "", refuse("the pull request removes or changes one of main's %s blocks. That is never planned in CI.", it.kind)
+		}
+		if hasCondition(it.node) {
+			return "", refuse("the pull request removes or changes a block of main's that has a precondition or postcondition. That is never planned in CI.")
+		}
+	}
+
 	main := mainTypes{data: map[string]bool{}, resource: map[string]bool{}}
 	for _, t := range bm.dataTypes {
 		main.data[t] = true
@@ -400,7 +431,8 @@ func load(dir string, isHead bool) (*model, error) {
 			}
 			add := func(id string, it *item) error {
 				if _, dup := m.items[id]; dup {
-					return fail("%s: %s is declared twice.", name, id)
+					// The block type only: an id can embed string literals.
+					return fail("%s: a %s block is declared twice.", name, b.Type)
 				}
 				m.items[id] = it
 				return nil
@@ -618,14 +650,19 @@ func checkTainted(id string, it *item, main mainTypes) error {
 		}
 		switch x := n.(type) {
 		case *hclsyntax.FunctionCallExpr:
-			if strings.Contains(x.Name, "::") {
+			if fileFunctions[strings.TrimPrefix(x.Name, "core::")] {
+				verr = refuse("%s calls %s(), which reads files. That is never planned in CI.", id, strings.TrimPrefix(x.Name, "core::"))
+			} else if strings.Contains(x.Name, "::") {
 				verr = refuse("%s calls a provider-defined function. Those are never planned in CI.", id)
-			} else if fileFunctions[x.Name] {
-				verr = refuse("%s calls %s(), which reads files. That is never planned in CI.", id, x.Name)
 			}
 		case *hclsyntax.Block:
 			if x.Type == "precondition" || x.Type == "postcondition" {
 				verr = refuse("%s has a %s, whose outcome can depend on any value. Those are never planned in CI when the pull request changes them.", id, x.Type)
+			}
+			if x.Type == "dynamic" {
+				if a, ok := x.Body.Attributes["for_each"]; ok && len(a.Expr.Variables()) > 0 {
+					verr = refuse("%s has a dynamic block whose for_each references a value. Only literal for_each is planned in CI.", id)
+				}
 			}
 		}
 		return nil
@@ -672,7 +709,7 @@ func checkLabels(b *hclsyntax.Block) error {
 func callsFileFunction(b *hclsyntax.Block) bool {
 	found := false
 	hclsyntax.VisitAll(b, func(n hclsyntax.Node) hcl.Diagnostics {
-		if f, ok := n.(*hclsyntax.FunctionCallExpr); ok && fileFunctions[f.Name] {
+		if f, ok := n.(*hclsyntax.FunctionCallExpr); ok && fileFunctions[strings.TrimPrefix(f.Name, "core::")] {
 			found = true
 		}
 		return nil
@@ -724,4 +761,15 @@ func sameOtherFiles(head, base string) error {
 		}
 	}
 	return nil
+}
+
+func hasCondition(n hclsyntax.Node) bool {
+	found := false
+	hclsyntax.VisitAll(n, func(x hclsyntax.Node) hcl.Diagnostics {
+		if b, ok := x.(*hclsyntax.Block); ok && (b.Type == "precondition" || b.Type == "postcondition") {
+			found = true
+		}
+		return nil
+	})
+	return found
 }
