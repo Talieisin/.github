@@ -36,12 +36,14 @@ name: Terraform plan (pinned)
 #           Plans the platform and compute tiers against a copy of their state,
 #           with each tier's .terraform.lock.hcl taken from main, so
 #           -lockfile=readonly refuses any provider the pull request adds. The
-#           rules read the files Terraform loads (never a git diff): a tier with
-#           a symbolic link, an override, .tf.json or terraform.d, a lock file
-#           unlike main's, a module, or any added, changed or removed line that
-#           names a provider, backend, remote state or credential setting, is
-#           not planned. Terraform's own output is never printed: the summary
-#           is names only, with instance keys hidden.
+#           rules (tier-rules.sh below) read the files Terraform loads, never a
+#           git diff. Frozen, byte for byte as main's: the lock file,
+#           versions.tf, backend.tf, every file that mentions remote state, and
+#           every variable file. Refused: symbolic links, override, .tf.json,
+#           terraform.d, configuration in a subdirectory, and any added,
+#           changed or removed line naming a module, provider, backend or
+#           credential setting. Terraform's own output is never printed: the
+#           summary is names only, with instance keys hidden.
 #   comment posts that summary (or why nothing was planned) on the pull
 #           request. No checkout; it runs nothing from the repository.
 #
@@ -54,7 +56,9 @@ name: Terraform plan (pinned)
 # copy), and azurerm resources that take a URL send requests, with a token, to
 # the host it names (azurerm_key_vault_encrypted_value posts to the vault host
 # in key_vault_key_id). What such a channel can reach is what the plan identity
-# can: both state files, the Tailscale storage key and log queries.
+# can: both state files, the Tailscale storage key and log queries. The
+# summary's row count shows how many instances of a resource change, which a
+# configuration could set from a value.
 #
 # Caller contract (caersid's .github/workflows/terraform-plan.yml):
 #   on: pull_request (opened, synchronize, reopened), never pull_request_target;
@@ -312,10 +316,11 @@ jobs:
           # the top-level attributes that differ), the names of changing outputs
           # and one row per drifted resource. It never prints a value: nothing
           # from "before", "after" or an output's value, no map key or nested
-          # path. An address's instance key (for_each or a string index) is
-          # replaced by […]: it can be any value the configuration computes. A
-          # numeric count index is kept. jq's own messages are discarded (they
-          # can quote input). Exit: 0 printed; 2 usage; 3 not a plan.
+          # path, no instance key: an address's key (for_each or count) is
+          # replaced by […], since the configuration can compute it from any
+          # value. The number of rows still shows how many instances change.
+          # jq's own messages are discarded (they can quote input).
+          # Exit: 0 printed; 2 usage; 3 not a plan.
           set -euo pipefail
           [ $# -eq 1 ] || exit 2
           tier=$1
@@ -323,14 +328,12 @@ jobs:
           out=$(jq -r --arg tier "$tier" '
             def clean: tostring | gsub("[`|\\r\\n]"; " ");
             # Everything before the first "[" is the static part of the address
-            # (type and name; modules are never planned). Keep [n], hide any
-            # other key.
+            # (type and name; modules are never planned). Every instance key,
+            # a count index too, is hidden: the configuration can compute it.
             def addr:
               (.address | tostring) as $a
               | ($a | split("[") | .[0]) as $static
-              | if ($a | contains("[")) | not then $a
-                elif ($a | test("^[^\\[]*\\[[0-9]+\\]$")) then $a
-                else $static + "[…]" end;
+              | if ($a | contains("[")) then $static + "[…]" else $a end;
             def act:
               if . == ["no-op"] then "no-op"
               elif . == ["read"] then "read"
@@ -474,14 +477,22 @@ jobs:
           # disguise). BASE_SHA (main's commit) in the environment.
           # A tier is not planned when, in the checkout:
           # - the tier directory or its tfvars file holds a symbolic link;
-          # - the tier has an override or .tf.json file, or a terraform.d
-          #   directory (an implicit provider mirror);
-          # - .terraform.lock.hcl differs from main's, byte for byte;
-          # - a root .tf file has a `module` block (in any spelling);
-          # - for any root .tf file name in main's tier or the checkout's, the
-          #   lines that name a provider, backend, remote state or credential
-          #   setting are not the same lines as main's (whitespace-normalised,
-          #   counted): a line added, changed, removed or moved to another file.
+          # - the tier has an override or .tf.json file or a terraform.d directory
+          #   (an implicit provider mirror), or any subdirectory holds Terraform
+          #   configuration (*.tf, *.tf.json, *.tofu);
+          # - a FROZEN file is not byte-identical to main's (or exists in only
+          #   one of them): .terraform.lock.hcl, versions.tf, backend.tf, every
+          #   root .tf file that mentions terraform_remote_state (in main or the
+          #   checkout), the tier's environments tfvars, terraform.tfvars and any
+          #   *.auto.tfvars (.json too). Their values, built or literal, are main's;
+          # - for any other root .tf file name, in main's tier or the checkout's,
+          #   the RISKY lines are not the same lines as main's (whitespace-
+          #   normalised, counted): one added, changed, removed or moved to another
+          #   file. A risky line is any line that is not wholly a # or // comment
+          #   and names, anywhere in it, a module, provider, backend, a terraform
+          #   block, remote state or a credential setting. `path.module` and a
+          #   resource ID's `/providers/` segment are not names; a comment after
+          #   code is not skipped (`/**/ module "m"` is a module).
           # Exit: 0 every rule holds; 3 a rule refuses (reason on stdout, one
           # line); 2 usage or an error (fails closed).
           set -euo pipefail
@@ -491,43 +502,70 @@ jobs:
           [[ ${BASE_SHA:-} =~ ^[0-9a-f]{40}$ ]] || exit 2
           rel="infrastructure/terraform/$tier"
           tfdir="$repo/$rel"
-          tfvars="$repo/infrastructure/terraform/environments/$tier-production.tfvars"
-          [ -d "$tfdir" ] && [ ! -L "$tfdir" ] || { echo "the tier directory is missing or a link"; exit 3; }
+          envrel="infrastructure/terraform/environments/$tier-production.tfvars"
           no() { printf '%s\n' "$1"; exit 3; }
-          # Whole-file reads only: no pipe into a reader that can stop early.
-          risky='(^|[^A-Za-z0-9_])(provider|providers|backend)([^A-Za-z0-9_]|$)|required_providers|terraform_remote_state|metadata_host|oidc_|msi_|use_cli|use_msi|endpoint|client_secret|client_certificate|^[[:space:]]*terraform([^A-Za-z0-9_]|$)'
-          module='^[[:space:]]*module([^A-Za-z0-9_-]|$)'
+          [ -d "$tfdir" ] && [ ! -L "$tfdir" ] || no "the tier directory is missing or a link."
           umask 077
           tmp=$(mktemp -d "${RUNNER_TEMP:-/tmp}/tier-rules.XXXXXX")
           trap 'rm -rf "$tmp"' EXIT
 
+          # Whole-file reads only: no pipe into a reader that can stop early.
           find "$tfdir" -type l > "$tmp/links"
           [ ! -s "$tmp/links" ] || no "the tier contains a symbolic link."
-          [ ! -L "$tfvars" ] || no "the tier's tfvars file is a symbolic link."
+          [ ! -L "$repo/$envrel" ] || no "the tier's tfvars file is a symbolic link."
           find "$tfdir" -maxdepth 1 \( -name '*.tf.json' -o -name 'override.tf' -o -name '*_override.tf' -o -name 'terraform.d' \) > "$tmp/special"
           [ ! -s "$tmp/special" ] || no "the tier has an override file, a .tf.json file or a terraform.d directory."
+          find "$tfdir" -mindepth 2 -type f \( -name '*.tf' -o -name '*.tf.json' -o -name '*.tofu' -o -name '*.tofu.json' \) > "$tmp/nested"
+          [ ! -s "$tmp/nested" ] || no "a subdirectory of the tier holds Terraform configuration (a module). Modules are never planned in CI."
 
-          git -C "$repo" cat-file blob "$BASE_SHA:$rel/.terraform.lock.hcl" > "$tmp/lock" || exit 2
-          [ -f "$tfdir/.terraform.lock.hcl" ] || no "the tier has no .terraform.lock.hcl."
-          cmp -s "$tmp/lock" "$tfdir/.terraform.lock.hcl" || no "the tier's .terraform.lock.hcl differs from main's. A provider change is never planned in CI."
+          # same <relative path> <reason>: byte-identical to main's, or absent from both.
+          same() {
+            local in_base=false in_head=false
+            if git -C "$repo" cat-file -e "$BASE_SHA:$1" 2> /dev/null; then
+              in_base=true
+              git -C "$repo" cat-file blob "$BASE_SHA:$1" > "$tmp/frozen" || exit 2
+            fi
+            [ -f "$repo/$1" ] && in_head=true
+            [ "$in_base" = "$in_head" ] || no "$2"
+            [ "$in_base" = false ] || cmp -s "$tmp/frozen" "$repo/$1" || no "$2"
+          }
+          same "$rel/.terraform.lock.hcl" "the tier's .terraform.lock.hcl differs from main's. A provider change is never planned in CI."
+          same "$envrel" "the tier's tfvars file differs from main's. Variable changes are never planned in CI."
 
-          # Root .tf files of main's tier and of the checkout's.
+          # The root file names of main's tier and of the checkout's.
           git -C "$repo" ls-tree --name-only "$BASE_SHA" "$rel/" > "$tmp/base-paths" || exit 2
           : > "$tmp/names"
           while IFS= read -r p; do
-            case $p in "$rel/"*.tf) printf '%s\n' "${p#"$rel/"}" >> "$tmp/names" ;; esac
+            case $p in "$rel/"*) printf '%s\n' "${p#"$rel/"}" >> "$tmp/names" ;; esac
           done < "$tmp/base-paths"
-          for f in "$tfdir"/*.tf; do
-            [ -e "$f" ] || continue
+          for f in "$tfdir"/* "$tfdir"/.[!.]*; do
+            [ -f "$f" ] || continue
             printf '%s\n' "${f##*/}" >> "$tmp/names"
           done
           sort -u "$tmp/names" -o "$tmp/names"
 
-          lines() { # <file>: the risky lines, whitespace-normalised, sorted
-            awk -v re="$risky" '$0 ~ re { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, ""); print }' "$1" > "$1.lines"
+          # Frozen by name: versions.tf, backend.tf, auto-loaded variable files.
+          while IFS= read -r name; do
+            case $name in
+              versions.tf | backend.tf | terraform.tfvars | terraform.tfvars.json | *.auto.tfvars | *.auto.tfvars.json)
+                same "$rel/$name" "$name differs from main's (providers, backend or variables). Those are never planned in CI." ;;
+            esac
+          done < "$tmp/names"
+
+          risky='(^|[^A-Za-z0-9_])(module|provider|providers|backend|required_providers|terraform_remote_state|metadata_host|use_cli|use_msi|use_oidc|client_secret|client_certificate[A-Za-z0-9_]*|oidc_[A-Za-z0-9_]*|msi_[A-Za-z0-9_]*)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])terraform[[:space:]]*[{]'
+          lines() { # <file>: its risky lines, whitespace-normalised, sorted
+            awk -v re="$risky" '
+              /^[[:space:]]*(#|\/\/)/ { next }
+              {
+                t = $0
+                gsub(/path[[:space:]]*\.[[:space:]]*module/, " ", t)
+                gsub(/\/providers\//, " ", t)
+                if (t ~ re) { l = $0; gsub(/[[:space:]]+/, " ", l); sub(/^ /, "", l); sub(/ $/, "", l); print l }
+              }' "$1" > "$1.lines"
             sort "$1.lines" -o "$1.lines"
           }
           while IFS= read -r name; do
+            case $name in *.tf) ;; *) continue ;; esac
             [[ $name =~ ^[A-Za-z0-9._-]+\.tf$ ]] || no "the tier has a .tf file whose name this check does not read."
             if git -C "$repo" cat-file -e "$BASE_SHA:$rel/$name" 2> /dev/null; then
               git -C "$repo" cat-file blob "$BASE_SHA:$rel/$name" > "$tmp/base.tf" || exit 2
@@ -535,13 +573,18 @@ jobs:
               : > "$tmp/base.tf"
             fi
             if [ -f "$tfdir/$name" ]; then cp "$tfdir/$name" "$tmp/head.tf"; else : > "$tmp/head.tf"; fi
+            # A file that mentions remote state, in main or here, is frozen.
             rc=0
-            grep -E "$module" "$tmp/head.tf" > /dev/null || rc=$?
-            case $rc in 0) no "$name has a module block. Modules are never planned in CI." ;; 1) ;; *) exit 2 ;; esac
+            grep -E 'terraform_remote_state' "$tmp/base.tf" "$tmp/head.tf" > /dev/null || rc=$?
+            case $rc in
+              0) same "$rel/$name" "$name mentions terraform_remote_state and differs from main's. Remote state is never changed in a planned pull request."; continue ;;
+              1) ;;
+              *) exit 2 ;;
+            esac
             lines "$tmp/base.tf"
             lines "$tmp/head.tf"
             cmp -s "$tmp/base.tf.lines" "$tmp/head.tf.lines" \
-              || no "$name adds, changes or removes a line that names a provider, backend, remote-state or credential setting. Those are never planned in CI."
+              || no "$name adds, changes or removes a line that names a module, provider, backend, remote-state or credential setting. Those are never planned in CI."
           done < "$tmp/names"
           echo "ok: the tier's rules hold"
           SCRIPT
@@ -849,7 +892,7 @@ jobs:
             fi
             how=' ·'
             if [ "$STATE" = planned ]; then
-              how=' · Planned as `id-caersid-plan-prod` by the pinned Talieisin/.github workflow, from a copy of the recorded state with main'"'"'s lock files, refresh on, no lock. Names only: no value and no instance key is shown.'
+              how=' · Planned as `id-caersid-plan-prod` by the pinned Talieisin/.github workflow, from a copy of the recorded state with main'"'"'s lock files, refresh on, no lock. Names only: no value and no instance key is shown (the number of rows is).'
             fi
             printf '<sub>Head `%s` · [run](%s)%s Not an approval: George plans and applies every tier himself.</sub>\n' "${HEAD_SHA:0:7}" "$RUN_URL" "$how"
           } > "$RUNNER_TEMP/body.md"
@@ -863,6 +906,12 @@ jobs:
 
   comment:
     needs: [gate, plan]
+    # One comment write at a time per pull request; with the head check
+    # below, an older run does not overwrite a newer run's comment (a run
+    # that checks the head just before a push lands can still write once).
+    concurrency:
+      group: terraform-plan-comment-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     # Also after a refused gate or a failed plan, so the pull request says so.
     # Never for a bot's pull request, a bot's push or a fork's.
     if: >-
