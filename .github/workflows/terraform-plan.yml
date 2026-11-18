@@ -1,0 +1,822 @@
+name: Terraform plan (pinned)
+# Terraform plan on pull requests for Talieisin/caersid (caersid #602), as a
+# reusable workflow that caersid calls at a full commit SHA. Azure trusts the
+# plan identity (id-caersid-plan-prod) only for a token whose subject names
+# THIS file at THAT SHA:
+#
+#   repo:Talieisin/caersid:pull_request:job_workflow_ref:Talieisin/.github/.github/workflows/terraform-plan.yml@<40-hex SHA>
+#
+# (caersid's OIDC subject template: include_claim_keys repo, context,
+# job_workflow_ref.) A pull request that edits caersid's caller can change the
+# inputs or the pin, but not what runs under that subject: another SHA, a
+# branch, a tag or an edited copy presents a different subject, which no
+# credential trusts. Every gate is therefore in this file, never in the caller.
+#
+# PIN EXCEPTION (George, 2026-11-18): caersid pins this workflow by exact SHA,
+# and Azure trusts exactly that SHA. Each bump: add the federated credential for
+# the new SHA BEFORE the bump merges, delete the old one after. No ref, tag or
+# wildcard subject: this repository is public, so a fork's commit is
+# addressable through it. Changing this file changes nothing in caersid until
+# the pin moves.
+#
+# Jobs:
+#   gate    no checkout, no credentials. Plans only George's own work:
+#           - a pull_request event on Talieisin/caersid, first run attempt;
+#           - the pull request opened by, and this run started by, George's
+#             account, matched by numeric id (PLAN_PERSON_ID);
+#           - same repository (no fork), based on main, the merge commit's base
+#             on main and its head the pull request's head;
+#           - every commit a signed commit of a person (caersid G1, G2);
+#           - every push to the branch, back to its creation, by George
+#             (activity API, a strict chain: anything unprovable refuses).
+#   plan    the only job with id-token: write, and only on run attempt 1 (a
+#           partial re-run reuses the gate's outputs, so it may not sign in).
+#           Plans the platform and compute tiers against a copy of their state,
+#           with each tier's .terraform.lock.hcl taken from the BASE, so
+#           -lockfile=readonly refuses any provider the pull request adds. A
+#           pull request that changes a lock file, provider or backend settings,
+#           or adds a module, is not planned. Terraform's own output is never
+#           printed: the summary is names only.
+#   comment posts that summary (or why nothing was planned) on the pull
+#           request. No checkout; it runs nothing from the repository.
+#
+# Residual George accepted (caersid G3, 2026-11-18): the pull request's own
+# Terraform runs in the plan job, which holds the token. The lock-file and
+# provider rules above narrow what that Terraform can do (azurerm only, with
+# the configuration main has), and the gate admits only George's pushes.
+#
+# Caller contract (caersid's .github/workflows/terraform-plan.yml):
+#   on: pull_request (opened, synchronize, reopened), never pull_request_target;
+#   permissions: contents read, pull-requests write, id-token write;
+#   jobs.<id>.uses: Talieisin/.github/.github/workflows/terraform-plan.yml@<SHA>
+#   with: azure-client-id, azure-tenant-id (IDs, not secrets); no secrets.
+#   Empty client or tenant ID: the plan job warns and plans nothing.
+#
+# Inputs reach scripts only through env, never by ${{ }} inside a script.
+
+on:
+  workflow_call:
+    inputs:
+      azure-client-id:
+        description: Client ID of id-caersid-plan-prod (empty = not configured, nothing planned)
+        type: string
+        default: ""
+      azure-tenant-id:
+        description: Tenant ID (empty = not configured, nothing planned)
+        type: string
+        default: ""
+      terraform-version:
+        description: Terraform release to install (N.N.N); follows George's Terraform
+        type: string
+        default: "1.14.9"
+      terraform-sha256:
+        description: SHA-256 of terraform_<version>_linux_amd64.zip from releases.hashicorp.com
+        type: string
+        default: "2e5cffc20a0b48a67a76268723bd5a10b8666f69b2aa4f04906e206726bedd63"
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # george-elphick-talieisin (numeric id: a login can be renamed and reused).
+  PLAN_PERSON_ID: "146720324"
+  PLAN_REPO: Talieisin/caersid
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  CHECKPOINT_DISABLE: "1"
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      result: ${{ steps.check.outputs.result }}
+      head-sha: ${{ steps.check.outputs.head-sha }}
+      base-sha: ${{ steps.check.outputs.base-sha }}
+    steps:
+      # result: ok | rerun | person | base | commits | pushes. Any API error, an
+      # unexpected answer or a head that moved fails this job instead, and plan
+      # does not start either way.
+      - name: Decide whether this pull request may be planned
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          SENDER_ID: ${{ github.event.sender.id }}
+          PR: ${{ github.event.pull_request.number }}
+          PR_USER_ID: ${{ github.event.pull_request.user.id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Plan gate::$1"; exit 1; }
+          refuse() { echo "::warning title=Nothing planned::$2"; echo "result=$1" >> "$GITHUB_OUTPUT"; exit 0; }
+          hex40='^[0-9a-f]{40}$'
+
+          [ "$REPO" = "$PLAN_REPO" ] || fail "this workflow plans $PLAN_REPO only, not $REPO"
+          [ "$EVENT" = pull_request ] || fail "event $EVENT: only pull_request is planned"
+          case $ACTION in opened | synchronize | reopened) ;; *) fail "pull_request action $ACTION is not planned" ;; esac
+          [[ $HEAD_SHA =~ $hex40 && $MERGE_SHA =~ $hex40 ]] || fail "the event has no head or merge commit"
+          [[ $PR =~ ^[1-9][0-9]*$ ]] || fail "the event has no pull request number"
+
+          # A partial re-run would reuse this job's outputs; a full re-run is
+          # started by whoever re-runs it. Neither is planned: push again.
+          [ "$RUN_ATTEMPT" = 1 ] || refuse rerun "run attempt $RUN_ATTEMPT: re-runs are never planned. Push again to plan."
+
+          # George's own pull request, and George's own push or reopen.
+          if [ "$PR_USER_ID" != "$PLAN_PERSON_ID" ] || [ "$ACTOR_ID" != "$PLAN_PERSON_ID" ] \
+             || [ "$SENDER_ID" != "$PLAN_PERSON_ID" ] || [ "$TRIGGERING_ACTOR" != "$ACTOR" ]; then
+            refuse person "only George's own pull requests and pushes are planned in CI. George plans this one locally."
+          fi
+
+          pull=$(gh api "repos/$REPO/pulls/$PR") || fail "the pull request could not be read"
+          jq -e --arg h "$HEAD_SHA" --arg r "$REPO" --argjson p "$PLAN_PERSON_ID" '
+            .state == "open" and .head.sha == $h and .head.repo.full_name == $r
+            and .base.repo.full_name == $r and .user.id == $p' <<<"$pull" >/dev/null 2>&1 \
+            || fail "the pull request is not open, is from a fork, has another author, or its head moved since this run started"
+          [ "$(jq -r '.base.ref' <<<"$pull")" = main ] \
+            || refuse base "this pull request is not based on main. Retarget it to main, then push again."
+          count=$(jq -er '.commits | numbers' <<<"$pull" 2>/dev/null) || fail "the pull request has no commit count"
+
+          # The merge commit this run plans: head = the pull request's head, base
+          # = a commit on main.
+          merge=$(gh api "repos/$REPO/commits/$MERGE_SHA") || fail "the merge commit could not be read"
+          [ "$(jq -r '.parents | length' <<<"$merge")" = 2 ] || fail "the merge commit does not have two parents"
+          base_sha=$(jq -r '.parents[0].sha' <<<"$merge")
+          [ "$(jq -r '.parents[1].sha' <<<"$merge")" = "$HEAD_SHA" ] || fail "the merge commit's second parent is not the pull request's head"
+          [[ $base_sha =~ $hex40 ]] || fail "the merge commit's base is not a commit"
+          on_main=$(gh api "repos/$REPO/compare/$base_sha...main" --jq '.status') || fail "the base could not be compared with main"
+          case $on_main in identical | ahead) ;; *) fail "the merge commit's base is not on main (compare: $on_main)" ;; esac
+
+          # Every commit a signed commit of a person (caersid G1, G2): author and
+          # committer linked Users, committer not web-flow, signature verified.
+          [ "$count" -le 250 ] || refuse commits "the pull request has $count commits; the API lists at most 250. George plans it locally."
+          raw=$(gh api --paginate "repos/$REPO/pulls/$PR/commits?per_page=100") || fail "the commits could not be listed"
+          commits=$(jq -esc 'add // [] | if type == "array" then . else error("not a list") end' <<<"$raw" 2>/dev/null) || fail "the commit list is not one this step reads"
+          [ "$(jq -r 'length' <<<"$commits")" = "$count" ] || fail "the API did not list all $count commits"
+          jq -e --arg h "$HEAD_SHA" 'any(.[]; .sha == $h)' <<<"$commits" >/dev/null 2>&1 || fail "the head is not among the listed commits"
+          others=$(jq -ec '[ .[] | select((.author | type) != "object" or .author.type != "User" or (.committer | type) != "object" or .committer.type != "User" or .committer.login == "web-flow" or .commit.verification.verified != true) ]' <<<"$commits" 2>/dev/null) || fail "the commits could not be classified"
+          n=$(jq -r 'length' <<<"$others")
+          if [ "$n" -ne 0 ]; then
+            jq -r '.[] | "not a signed commit of a person: \(.sha[0:7]) author \(.author.login // "(not linked)"), committer \(.committer.login // "(not linked)"), verified \(.commit.verification.verified)"' <<<"$others"
+            refuse commits "$n of $count commits are not signed commits of a person. George plans this pull request locally, or rebases it and pushes signed commits."
+          fi
+
+          # Every push to the head branch, newest first, as one chain back to
+          # its creation: the newest event's after is the head; each event's
+          # before is the next older event's after; the oldest is the branch's
+          # creation from nothing; every actor is George's account (a User, by
+          # numeric id); only pushes, force-pushes and the creation. Pagination
+          # must complete. Anything else, or anything missing, refuses.
+          raw=$(gh api --paginate -X GET "repos/$REPO/activity" -f ref="refs/heads/$HEAD_REF" -f direction=desc -f per_page=100) \
+            || fail "the branch's push history could not be read"
+          events=$(jq -esc 'add // [] | if type == "array" then . else error("not a list") end' <<<"$raw" 2>/dev/null) \
+            || fail "the branch's push history is not one this step reads"
+          verdict=$(jq -r --arg head "$HEAD_SHA" --arg ref "refs/heads/$HEAD_REF" --argjson pid "$PLAN_PERSON_ID" '
+            def zero: "0000000000000000000000000000000000000000";
+            def sha: type == "string" and test("^[0-9a-f]{40}$");
+            . as $ev
+            | if ($ev | length) == 0 then "no push history for the branch"
+              elif $ev[0].after != $head then "the newest push is not the pull request head"
+              else
+                reduce range(0; $ev | length) as $i ({done: false, bad: null, n: 0};
+                  if .done or .bad != null then . else
+                    $ev[$i] as $e
+                    | if ($e | type) != "object" then .bad = "an event that is not an object"
+                      elif $e.ref != $ref then .bad = "an event for another ref"
+                      elif ($e.actor | type) != "object" or $e.actor.type != "User" or $e.actor.id != $pid
+                        then .bad = "a push by \($e.actor.login // "an unknown actor") (\($e.actor.type // "no type")), not George"
+                      elif ([$e.activity_type] | inside(["push", "force_push", "branch_creation"]) | not)
+                        then .bad = "a \($e.activity_type // "untyped") event in the chain"
+                      elif ($e.after | sha | not) or ($e.before | sha | not) then .bad = "an event without commit ids"
+                      elif $i > 0 and $ev[$i - 1].before != $e.after then .bad = "a gap in the push chain"
+                      elif $i > 0 and (($ev[$i - 1].timestamp // "") < ($e.timestamp // "")) then .bad = "pushes out of order"
+                      elif $e.activity_type == "branch_creation"
+                        then (if $e.before == zero then .done = true | .n += 1 else .bad = "a branch creation from a commit" end)
+                      else .n += 1 end
+                  end)
+                | if .bad != null then .bad
+                  elif .done | not then "the chain does not reach the branch creation"
+                  else "ok \(.n)" end
+              end' <<<"$events" 2>/dev/null) || fail "the push history could not be checked"
+          case $verdict in
+            "ok "*) echo "ok: ${verdict#ok } pushes, all by George, from the branch creation to the head" ;;
+            *) refuse pushes "the branch's push history does not prove George pushed everything: $verdict. George plans this pull request locally." ;;
+          esac
+
+          # Nothing moved while the above was read.
+          again=$(gh api "repos/$REPO/pulls/$PR") || fail "the pull request could not be read again"
+          jq -e --arg h "$HEAD_SHA" --argjson c "$count" '.head.sha == $h and .base.ref == "main" and .commits == $c' <<<"$again" >/dev/null 2>&1 \
+            || fail "the pull request's head, base or commits changed during the checks; the next run checks it"
+
+          echo "ok: every check passed"
+          {
+            echo "result=ok"
+            echo "head-sha=$HEAD_SHA"
+            echo "base-sha=$base_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  plan:
+    needs: gate
+    # Literal ids and repository: nothing a caller passes. run_attempt 1 only.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.repository == 'Talieisin/caersid' &&
+      github.run_attempt == '1' &&
+      github.actor_id == '146720324' &&
+      github.event.pull_request.user.id == 146720324 &&
+      github.event.sender.id == 146720324 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      needs.gate.outputs.result == 'ok'
+    # GitHub-hosted: the job that holds the sign-in never runs on a third
+    # party's runner.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      body: ${{ steps.body.outputs.markdown }}
+    env:
+      STATE_ACCOUNT: tlsntfstate
+      STATE_CONTAINER: tfstate
+      PLATFORM_STATE_BLOB: caersid/platform-production.tfstate
+      COMPUTE_STATE_BLOB: caersid/compute-production.tfstate
+      HEAD_SHA: ${{ needs.gate.outputs.head-sha }}
+      BASE_SHA: ${{ needs.gate.outputs.base-sha }}
+    steps:
+      # The merge commit and both parents. No cache anywhere in this job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Check the checkout is the gated commit
+        env:
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$MERGE_SHA" ] || { echo "::error::the checkout is not the merge commit"; exit 1; }
+          [ "$(git rev-parse HEAD^1)" = "$BASE_SHA" ] || { echo "::error::the merge commit's base is not the gated base"; exit 1; }
+          [ "$(git rev-parse HEAD^2)" = "$HEAD_SHA" ] || { echo "::error::the merge commit's head is not the gated head"; exit 1; }
+
+      # The plan and identity-check scripts, written from THIS file (the pinned
+      # one), never taken from the pull request. Read-only, in a private
+      # directory.
+      - name: Write the plan scripts
+        run: |
+          set -euo pipefail
+          umask 077
+          bin="$RUNNER_TEMP/tfplan-bin"
+          mkdir -p "$bin"
+          # An empty CLI configuration: no plugin cache, no dev overrides, no
+          # provider mirror.
+          : > "$RUNNER_TEMP/terraform.rc"
+
+          cat > "$bin/plan-summary.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          # terraform show -json <plan> | plan-summary.sh <tier>: names only.
+          # Ported from caersid's ci-plan-summary.sh (#588). It never prints a
+          # value: no "before", "after" or output value; no map keys or nested
+          # paths. jq's own messages are discarded (they can quote input).
+          set -euo pipefail
+          [ $# -eq 1 ] || exit 2
+          tier=$1
+          case $tier in platform | compute) ;; *) exit 2 ;; esac
+          out=$(jq -r --arg tier "$tier" '
+            def clean: tostring | gsub("[`|\\r\\n]"; " ");
+            def act:
+              if . == ["no-op"] then "no-op"
+              elif . == ["read"] then "read"
+              elif . == ["create"] then "create"
+              elif . == ["update"] then "update"
+              elif . == ["delete"] then "delete"
+              elif . == ["delete", "create"] or . == ["create", "delete"] then "replace"
+              elif . == ["forget"] then "forget"
+              else "other" end;
+            def obj: if type == "object" then . else {} end;
+            def differing($c):
+              ($c.before | obj) as $b | ($c.after | obj) as $a
+              | [ (($b | keys) + ($a | keys) | unique)[] | select($b[.] != $a[.]) ];
+            if type != "object" or (.format_version | type) != "string"
+            then error("not a JSON plan") else . end
+            | [ (.resource_changes // [])[] | select(.mode == "managed") | . + { a: (.change.actions | act) } | select(.a != "no-op" and .a != "read") ] as $rc
+            | ([ $rc[] | select(.a == "create" or .a == "replace") ] | length) as $add
+            | ([ $rc[] | select(.a == "update") ] | length) as $chg
+            | ([ $rc[] | select(.a == "delete" or .a == "replace") ] | length) as $del
+            | ([ $rc[] | select(.a == "forget" or .a == "other") ] | length) as $oth
+            | [ (.output_changes // {}) | to_entries[] | { name: .key, a: (.value.actions | act) } | select(.a != "no-op") ] as $oc
+            | [ (.resource_drift // [])[] | select(.mode == "managed") | . + { a: (.change.actions | act) } | select(.a != "no-op" and .a != "read") ] as $rd
+            | "#### \($tier) tier",
+              "",
+              ( if (.errored // false) then "**The plan is incomplete: Terraform reported errors.**", "" else empty end ),
+              ( if ($rc | length) == 0 and ($oc | length) == 0 then "No changes."
+                else "Plan: \($add) to add, \($chg) to change, \($del) to destroy." + (if $oth > 0 then " \($oth) other (forget or unrecognised action): read the plan locally." else "" end)
+                end ),
+              ( if ($rc | length) > 0 then
+                  "",
+                  "| Action | Resource | Top-level attributes that differ (names only) |",
+                  "|---|---|---|",
+                  ( $rc[] | "| \(.a) | `\(.address | clean)` | \( if .a == "update" or .a == "replace" then (differing(.change) | map(clean) | join(", ")) else "" end ) |" )
+                else empty end ),
+              ( if ($oc | length) > 0 then
+                  "",
+                  "Outputs: " + ( [ $oc[] | "\(.a) `\(.name | clean)`" ] | join(", ") )
+                else empty end ),
+              ( if ($rd | length) > 0 then
+                  "",
+                  "Drift: live Azure differs from the recorded state for \($rd | length) resource(s), as the plan identity sees them. An attribute it may not read (a key) can be listed without having changed.",
+                  "",
+                  "| Drift | Resource | Top-level attributes that differ (names only) |",
+                  "|---|---|---|",
+                  ( $rd[] | "| \(.a) | `\(.address | clean)` | \( if .a == "update" then (differing(.change) | map(clean) | join(", ")) else "" end ) |" )
+                else "", "Drift: none found by the refresh." end )
+          ' 2>/dev/null) || exit 3
+          [ -n "$out" ] || exit 3
+          printf '%s\n' "$out"
+          SCRIPT
+
+          cat > "$bin/check-identity.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          # Prove what the plan identity can and cannot do with the state before
+          # anything is fetched or planned. Ported from caersid's
+          # ci-check-plan-identity.sh (#588): own blobs readable (HEAD 200);
+          # other blobs, a container list, a prefix list and a lease renewal
+          # with a made-up lease id refused (403 AuthorizationPermissionMismatch).
+          # No response body is printed. Exit: 0 as required; 4 holds a
+          # permission it must not; 5 could not tell.
+          set -euo pipefail
+          account='' container=''
+          own=() other=()
+          while [ $# -gt 0 ]; do
+            case $1 in
+              --account) account=$2; shift 2 ;;
+              --container) container=$2; shift 2 ;;
+              --own) own+=("$2"); shift 2 ;;
+              --other) other+=("$2"); shift 2 ;;
+              *) exit 2 ;;
+            esac
+          done
+          [[ $account =~ ^[a-z0-9]{3,24}$ ]] || exit 2
+          [[ $container =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]] || exit 2
+          if [ "${#own[@]}" -eq 0 ] || [ "${#other[@]}" -eq 0 ]; then exit 2; fi
+          for b in "${own[@]}" "${other[@]}"; do [[ $b =~ ^[A-Za-z0-9._/-]+$ ]] || exit 2; done
+          base="https://$account.blob.core.windows.net/$container"
+          umask 077
+          work=$(mktemp -d "$RUNNER_TEMP/check-identity.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          if ! token=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv 2>/dev/null) || [ -z "$token" ]; then
+            echo "FAIL: no storage token from az"; exit 5
+          fi
+          echo "::add-mask::$token"
+          request() {
+            local method=$1 url=$2 conf h
+            shift 2
+            conf=$(printf 'url = "%s"\nheader = "Authorization: Bearer %s"\nheader = "x-ms-version: 2023-11-03"\n' "$url" "$token")
+            for h in "$@"; do conf=$(printf '%s\nheader = "%s"' "$conf" "$h"); done
+            : > "$work/headers"
+            if [ "$method" = HEAD ]; then
+              printf '%s\n' "$conf" | curl --silent --max-time 30 --head --config - --output /dev/null --dump-header "$work/headers" --write-out '%{http_code}' 2>/dev/null || printf '000'
+            else
+              printf '%s\n' "$conf" | curl --silent --max-time 30 --request "$method" --config - --output /dev/null --dump-header "$work/headers" --write-out '%{http_code}' 2>/dev/null || printf '000'
+            fi
+          }
+          error_code() { awk '{ sub(/\r$/, "") } tolower($0) ~ /^x-ms-error-code:/ { sub(/^[^:]*:[[:space:]]*/, ""); v = $0 } END { print v }' "$work/headers"; }
+          oks=0 fails=0 worst=0
+          pass() { oks=$((oks + 1)); echo "ok: $1"; }
+          flunk() { fails=$((fails + 1)); echo "FAIL: $2"; if [ "$1" -eq 4 ] || [ "$worst" -eq 0 ]; then worst=$1; fi; }
+          refused() {
+            local text=$1 status=$2 code s
+            shift 2
+            code=$(error_code)
+            if [ "$status" = 403 ] && [ "$code" = AuthorizationPermissionMismatch ]; then pass "$text is refused"; return; fi
+            for s in "$@"; do
+              if [ "$status" = "$s" ]; then flunk 4 "$text was authorised (HTTP $status${code:+, $code}): the plan identity holds a permission it must not"; return; fi
+            done
+            flunk 5 "$text: unexpected answer (HTTP $status${code:+, $code}), cannot tell"
+          }
+          for b in "${own[@]}"; do
+            status=$(request HEAD "$base/$b")
+            if [ "$status" = 200 ]; then pass "read $b"; else flunk 5 "cannot read its own state $b (HTTP $status)"; fi
+          done
+          for b in "${other[@]}"; do
+            status=$(request HEAD "$base/$b")
+            refused "read $b" "$status" 200 404
+          done
+          status=$(request GET "$base?restype=container&comp=list&maxresults=1")
+          refused "list $container" "$status" 200
+          for b in "${own[@]}"; do
+            status=$(request GET "$base?restype=container&comp=list&maxresults=1&prefix=${b//\//%2F}")
+            refused "list $container with prefix $b" "$status" 200
+          done
+          for b in "${own[@]}"; do
+            status=$(request PUT "$base/$b?comp=lease" "x-ms-lease-action: renew" "x-ms-lease-id: $(cat /proc/sys/kernel/random/uuid)" "Content-Length: 0")
+            refused "renew a lease on $b" "$status" 200 409 412
+          done
+          unset token
+          echo "checked: $oks ok, $fails failed"
+          exit "$worst"
+          SCRIPT
+
+          cat > "$bin/plan-tier.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          # plan-tier.sh <tier> <summary file>: plan one tier against a copy of
+          # its recorded state. Ported from caersid's ci-plan-tier.sh (#588),
+          # with the #602 rules:
+          # - the tier is not planned (exit 3) when the pull request changes its
+          #   .terraform.lock.hcl, a provider, required_providers or backend
+          #   setting, an override or .tf.json file, or the tier has a module;
+          # - the lock file used is the BASE's, so -lockfile=readonly refuses
+          #   any provider the pull request adds;
+          # - the backend key is allow-listed; local backend, -lock=false;
+          # - Terraform's output is never printed; the summary is names only.
+          # Exit: 0 summary written; 2 usage or key; 3 not planned by rule;
+          # 5 fetch; 6 init; 7 plan; 8 summary.
+          set -euo pipefail
+          tier=$1 summary=$2
+          case $tier in platform | compute) ;; *) exit 2 ;; esac
+          tfroot=infrastructure/terraform
+          bin=$(cd "$(dirname "$0")" && pwd)
+
+          say() { echo "::error title=$tier tier not planned::$1"; }
+          fail() {
+            local stage=$1 code=$2 class=$3 status=$4
+            printf '#### %s tier\n\n**Not planned: %s failed (%s, class %s).** Terraform'"'"'s output is withheld because it can quote values from the state. To see it, run `./scripts/plan.sh production %s` locally.\n' \
+              "$tier" "$stage" "$status" "$class" "$tier" > "$summary"
+            say "$stage failed ($status, class $class). Terraform's output is withheld; run ./scripts/plan.sh production $tier locally."
+            exit "$code"
+          }
+          refuse() {
+            printf '#### %s tier\n\n**Not planned: %s** George plans this tier locally (`./scripts/plan.sh production %s`).\n' "$tier" "$1" "$tier" > "$summary"
+            echo "::warning title=$tier tier not planned::$1"
+            exit 3
+          }
+          classify() {
+            local f p
+            for p in 'AuthorizationFailed|AuthorizationPermissionMismatch|does not have authorization|StatusCode=403|403 Forbidden:authorisation' \
+                     'state snapshot was created by Terraform v|newer version of Terraform:state-version' \
+                     'dependency lock file|locked provider|provider registry|Failed to query available provider:lock-file' \
+                     'Invalid value for (input )?variable|No value for required variable:variables' \
+                     'Instance cannot be destroyed:prevent-destroy'; do
+              for f in "$@"; do
+                [ -f "$f" ] || continue
+                if grep -qE "${p%:*}" "$f"; then echo "${p##*:}"; return; fi
+              done
+            done
+            echo unclassified
+          }
+
+          # 1. Rules on what the pull request changes: the merge commit (HEAD)
+          # against its base, as caersid's own checks diff it.
+          lock="$tfroot/$tier/.terraform.lock.hcl"
+          git cat-file -e "$BASE_SHA:$lock" 2>/dev/null || fail lock 2 lock-file "main has no $lock"
+          if ! git diff --quiet "$BASE_SHA" HEAD -- "$lock"; then
+            refuse "this pull request changes \`$lock\`. A provider change is never planned in CI."
+          fi
+          paths=("$tfroot/$tier" "$tfroot/environments/$tier-production.tfvars")
+          # The tier's provider and backend blocks live in these two files.
+          if ! git diff --quiet "$BASE_SHA" HEAD -- "$tfroot/$tier/versions.tf" "$tfroot/$tier/backend.tf"; then
+            refuse "this pull request changes the tier's \`versions.tf\` or \`backend.tf\` (providers and backend)."
+          fi
+          if git diff --name-only "$BASE_SHA" HEAD -- "${paths[@]}" | grep -qE '\.tf\.json$|(^|/)override\.tf$|_override\.tf$'; then
+            refuse "this pull request changes a \`.tf.json\` or override file in the tier."
+          fi
+          if git diff -U0 --no-color "$BASE_SHA" HEAD -- "${paths[@]}" \
+             | grep -E '^[-+]' | grep -vE '^(\+\+\+|---) ' \
+             | grep -qE '\bprovider\b|required_providers|\bbackend\b|terraform_remote_state|metadata_host|oidc_|msi_|use_cli|use_msi|^[-+][[:space:]]*terraform[[:space:]]*\{'; then
+            refuse "this pull request changes a provider, backend or remote-state setting (or a line that names one). Those are never planned in CI."
+          fi
+
+          # 2. The backend key, allow-listed.
+          want_key="caersid/$tier-production.tfstate"
+          key=$(sed -nE 's/^[[:space:]]*key[[:space:]]*=[[:space:]]*"([^"]*)".*$/\1/p' "$tfroot/$tier/backend-production.hcl" 2>/dev/null || true)
+          [ "$key" = "$want_key" ] || fail key 2 unclassified "the key in $tier/backend-production.hcl is not $want_key"
+
+          # 3. A private copy, without local state, plans, .terraform or
+          # override files; the base's lock file.
+          umask 077
+          work=$(mktemp -d "$RUNNER_TEMP/plan-tier.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          src="$work/src/$tier"
+          mkdir -p "$work/src/environments" "$work/state"
+          tar -C "$tfroot" -cf - --exclude .terraform --exclude '*.tfplan' --exclude '*.tfstate*' \
+            --exclude '*_override.tf' --exclude 'override.tf' --exclude '*_override.tf.json' --exclude 'override.tf.json' \
+            --exclude '*.tf.json' "$tier" | tar -C "$work/src" -xf -
+          cp "$tfroot/environments/$tier-production.tfvars" "$work/src/environments/"
+          git show "$BASE_SHA:$lock" > "$src/.terraform.lock.hcl"
+          if grep -rqE '^[[:space:]]*module[[:space:]]+"' --include='*.tf' "$src"; then
+            refuse "the tier has a \`module\` block. Modules are never planned in CI."
+          fi
+
+          # 4. The state blob, by its exact name.
+          statefile="$work/state/terraform.tfstate"
+          if ! token=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv 2>/dev/null) || [ -z "$token" ]; then
+            fail fetch 5 unclassified "no storage token from az"
+          fi
+          echo "::add-mask::$token"
+          status=$(printf 'url = "https://%s.blob.core.windows.net/%s/%s"\nheader = "Authorization: Bearer %s"\nheader = "x-ms-version: 2023-11-03"\n' \
+            "$STATE_ACCOUNT" "$STATE_CONTAINER" "$key" "$token" \
+            | curl --silent --max-time 120 --config - --output "$statefile" --write-out '%{http_code}' 2>/dev/null) || status=000
+          unset token
+          case $status in
+            200) ;;
+            401 | 403) fail fetch 5 authorisation "HTTP $status" ;;
+            *) fail fetch 5 unclassified "HTTP $status" ;;
+          esac
+          jq -e '.version and .terraform_version' "$statefile" > /dev/null 2>&1 || fail fetch 5 unclassified "HTTP 200, the body is not a Terraform state"
+
+          # 5. Local backend in the copy only: no shared backend, no lock.
+          printf 'terraform {\n  backend "local" {}\n}\n' > "$src/zz_ci_backend_override.tf"
+
+          # 6. Init (base lock, read-only), plan, show. Output stays in $work.
+          rc=0
+          terraform -chdir="$src" init -input=false -no-color -lockfile=readonly -backend-config="path=$statefile" > "$work/init.log" 2>&1 || rc=$?
+          [ "$rc" -eq 0 ] || fail init 6 "$(classify "$work/init.log")" "exit $rc"
+          rc=0
+          terraform -chdir="$src" plan -input=false -no-color -lock=false -detailed-exitcode \
+            -var-file="../environments/$tier-production.tfvars" -out="$work/tier.tfplan" > "$work/plan.out" 2> "$work/plan.err" || rc=$?
+          case $rc in 0 | 2) ;; *) fail plan 7 "$(classify "$work/plan.err" "$work/plan.out")" "exit $rc" ;; esac
+          if ! terraform -chdir="$src" show -json "$work/tier.tfplan" 2> /dev/null | "$bin/plan-summary.sh" "$tier" > "$work/summary.md" 2> /dev/null; then
+            fail summary 8 unclassified "the plan could not be summarised"
+          fi
+          cp "$work/summary.md" "$summary"
+          echo "ok: $tier planned"
+          SCRIPT
+
+          chmod 500 "$bin"/*.sh
+          chmod 500 "$bin"
+
+      # Which tiers the pull request changes (the merge commit against its base).
+      # Ported from caersid's ci-changed-tiers.sh: an unmapped path under
+      # infrastructure/terraform/ fails the job, so a new tier cannot go
+      # unplanned silently. A change to caersid's caller of this workflow
+      # plans both tiers.
+      - name: Find the changed tiers
+        id: tiers
+        run: |
+          set -euo pipefail
+          tf=infrastructure/terraform
+          git diff --no-renames --name-only "$BASE_SHA" HEAD > "$RUNNER_TEMP/changed.txt"
+          platform=false compute=false identity=false harness=false unmapped=
+          while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            case $path in
+              "$tf/platform/"* | "$tf/environments/platform-production.tfvars") platform=true ;;
+              "$tf/compute/"* | "$tf/environments/compute-production.tfvars") compute=true ;;
+              "$tf/identity/"* | "$tf/environments/local.tfvars" | "$tf/environments/production.tfvars") identity=true ;;
+              .github/workflows/terraform-plan.yml) harness=true ;;
+              "$tf/scripts/"*) ;;
+              "$tf/"*) unmapped="$unmapped $path" ;;
+              *) ;;
+            esac
+          done < "$RUNNER_TEMP/changed.txt"
+          if [ -n "$unmapped" ]; then
+            echo "::error title=Unmapped Terraform path::path(s) under $tf/ that map to no tier:$unmapped. Map them in Talieisin/.github's terraform-plan.yml."
+            exit 1
+          fi
+          plan_platform=false plan_compute=false
+          if [ "$platform" = true ] || [ "$harness" = true ]; then plan_platform=true; fi
+          if [ "$compute" = true ] || [ "$harness" = true ]; then plan_compute=true; fi
+          printf 'platform=%s\ncompute=%s\nidentity=%s\nharness=%s\nplan_platform=%s\nplan_compute=%s\n' \
+            "$platform" "$compute" "$identity" "$harness" "$plan_platform" "$plan_compute" >> "$GITHUB_OUTPUT"
+
+      # state: planned | not-needed | not-configured. Only planned signs in.
+      - name: Decide whether to plan
+        id: gate
+        env:
+          PLAN_PLATFORM: ${{ steps.tiers.outputs.plan_platform }}
+          PLAN_COMPUTE: ${{ steps.tiers.outputs.plan_compute }}
+          CLIENT_ID: ${{ inputs.azure-client-id }}
+          TENANT_ID: ${{ inputs.azure-tenant-id }}
+        run: |
+          set -euo pipefail
+          uuid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          if [ "$PLAN_PLATFORM" != true ] && [ "$PLAN_COMPUTE" != true ]; then
+            state=not-needed
+          elif [ -z "$CLIENT_ID" ] || [ -z "$TENANT_ID" ]; then
+            echo "::warning title=Nothing planned::azure-client-id or azure-tenant-id is not set in the caller."
+            state=not-configured
+          elif ! [[ $CLIENT_ID =~ $uuid && $TENANT_ID =~ $uuid ]]; then
+            echo "::error title=Nothing planned::azure-client-id and azure-tenant-id must be lower-case GUIDs."
+            exit 1
+          else
+            state=planned
+          fi
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      # The pinned release, checked against its SHA-256 before it is unzipped
+      # or put on the path. Ported from caersid's ci-install-terraform.sh.
+      - name: Install Terraform
+        if: steps.gate.outputs.state == 'planned'
+        env:
+          TERRAFORM_VERSION: ${{ inputs.terraform-version }}
+          TERRAFORM_SHA256: ${{ inputs.terraform-sha256 }}
+        run: |
+          set -euo pipefail
+          [[ $TERRAFORM_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::terraform-version must be N.N.N"; exit 1; }
+          [[ $TERRAFORM_SHA256 =~ ^[0-9a-f]{64}$ ]] || { echo "::error::terraform-sha256 must be 64 lower-case hex"; exit 1; }
+          zip="$RUNNER_TEMP/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          tfbin="$RUNNER_TEMP/terraform-bin"
+          curl -fsSL --retry 3 --max-time 300 -o "$zip" \
+            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          got=$(sha256sum "$zip")
+          got=${got%% *}
+          if [ "$got" != "$TERRAFORM_SHA256" ]; then
+            rm -f "$zip"
+            echo "::error::checksum mismatch for Terraform $TERRAFORM_VERSION; nothing installed"
+            exit 1
+          fi
+          mkdir -p "$tfbin"
+          unzip -o -q "$zip" terraform -d "$tfbin"
+          rm -f "$zip"
+          chmod 555 "$tfbin/terraform"
+          echo "$tfbin" >> "$GITHUB_PATH"
+          "$tfbin/terraform" version
+
+      # az, for the storage tokens of the check and of the state fetch.
+      # Terraform signs in by itself (ARM_USE_OIDC below).
+      - if: steps.gate.outputs.state == 'planned'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          allow-no-subscriptions: true
+
+      - name: Check the plan identity
+        id: check
+        if: steps.gate.outputs.state == 'planned'
+        run: >-
+          "$RUNNER_TEMP/tfplan-bin/check-identity.sh"
+          --account "$STATE_ACCOUNT" --container "$STATE_CONTAINER"
+          --own "$PLATFORM_STATE_BLOB" --own "$COMPUTE_STATE_BLOB"
+          --other caersid/identity-production.tfstate
+          --other caersid/identity-local.tfstate
+
+      # Exit 3 (a #602 rule refused the tier) is not a failure: the summary
+      # says why.
+      - name: Plan the platform tier
+        if: steps.check.outcome == 'success' && steps.tiers.outputs.plan_platform == 'true'
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
+          ARM_TENANT_ID: ${{ inputs.azure-tenant-id }}
+          TF_CLI_CONFIG_FILE: ${{ runner.temp }}/terraform.rc
+        run: |
+          rc=0
+          "$RUNNER_TEMP/tfplan-bin/plan-tier.sh" platform "$RUNNER_TEMP/platform.md" || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
+
+      - name: Plan the compute tier
+        if: ${{ !cancelled() && steps.check.outcome == 'success' && steps.tiers.outputs.plan_compute == 'true' }}
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ inputs.azure-client-id }}
+          ARM_TENANT_ID: ${{ inputs.azure-tenant-id }}
+          TF_CLI_CONFIG_FILE: ${{ runner.temp }}/terraform.rc
+        run: |
+          rc=0
+          "$RUNNER_TEMP/tfplan-bin/plan-tier.sh" compute "$RUNNER_TEMP/compute.md" || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
+
+      # The comment, from the names-only summaries and fixed text only. Ported
+      # from caersid's ci-plan-comment-body.sh. Each summary is cut at 25000
+      # characters, so two fit under GitHub's 65536.
+      - name: Write the comment body
+        id: body
+        if: ${{ !cancelled() && steps.gate.outputs.state != '' }}
+        env:
+          STATE: ${{ steps.gate.outputs.state }}
+          PLATFORM: ${{ steps.tiers.outputs.platform }}
+          COMPUTE: ${{ steps.tiers.outputs.compute }}
+          IDENTITY: ${{ steps.tiers.outputs.identity }}
+          HARNESS: ${{ steps.tiers.outputs.harness }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          flag() { [ "${1:-false}" = true ]; }
+          if ! flag "$PLATFORM" && ! flag "$COMPUTE" && ! flag "$IDENTITY" && ! flag "$HARNESS"; then
+            echo "markdown=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          section() {
+            local tier=$1 own=$2 file=$3 text size
+            printf '#### %s tier\n\n' "$tier"
+            if ! flag "$own" && flag "$HARNESS"; then
+              printf 'This tier did not change; it is planned because the caller of the plan workflow changed.\n\n'
+            fi
+            case $STATE in
+              not-configured) printf 'Not planned: the caller passes no `azure-client-id` or `azure-tenant-id`.\n'; return ;;
+              not-needed) printf 'Not planned: the job found nothing to plan. Read the run.\n'; return ;;
+            esac
+            if [ ! -s "$file" ]; then printf '**Not planned: an earlier step of the job failed. Read the run.**\n'; return; fi
+            size=$(wc -c < "$file" | tr -d ' ')
+            if [ "$size" -gt 25000 ]; then
+              text=$(head -c 25000 "$file")
+              text="$text"$'\n\n(truncated: read the run summary)'
+            else
+              text=$(cat "$file")
+            fi
+            if [ "${text%%$'\n'*}" = "#### $tier tier" ]; then text=${text#*$'\n'}; text=${text#$'\n'}; fi
+            printf '%s\n' "$text"
+            if [ "$tier" = compute ] && ! grep -qF '**Not planned:' "$file"; then
+              printf '\nAfter a deploy, `azurerm_container_app.this` is expected in the drift table: the deploy procedure owns the image.\n'
+            fi
+          }
+          {
+            printf '<!-- caersid-terraform-plan -->\n### Terraform plan (#588)\n\n'
+            if flag "$PLATFORM" || flag "$HARNESS"; then section platform "$PLATFORM" "$RUNNER_TEMP/platform.md"; printf '\n'; fi
+            if flag "$COMPUTE" || flag "$HARNESS"; then section compute "$COMPUTE" "$RUNNER_TEMP/compute.md"; printf '\n'; fi
+            if flag "$IDENTITY"; then
+              printf '**identity tier changed.** Validated only. It is never planned in CI (#588): its state holds the sign-in client secret, and identity work is George'"'"'s. He plans it: `./scripts/plan.sh production` (and `local`).\n\n'
+            fi
+            how=' ·'
+            if [ "$STATE" = planned ]; then
+              how=' · Planned as `id-caersid-plan-prod` by the pinned Talieisin/.github workflow, from a copy of the recorded state with main'"'"'s lock files, refresh on, no lock. Names only: no value is shown.'
+            fi
+            printf '<sub>Head `%s` · [run](%s)%s Not an approval: George plans and applies every tier himself.</sub>\n' "${HEAD_SHA:0:7}" "$RUN_URL" "$how"
+          } > "$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md" >> "$GITHUB_STEP_SUMMARY"
+          delimiter="body-$(openssl rand -hex 16)"
+          {
+            echo "markdown<<$delimiter"
+            cat "$RUNNER_TEMP/body.md"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+  comment:
+    needs: [gate, plan]
+    # Also after a refused gate or a failed plan, so the pull request says so.
+    # Never for a bot's pull request, a bot's push or a fork's.
+    if: >-
+      ${{ !cancelled() &&
+      github.event_name == 'pull_request' &&
+      github.repository == 'Talieisin/caersid' &&
+      github.event.pull_request.user.type != 'Bot' &&
+      github.event.sender.type != 'Bot' &&
+      github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      # No checkout: this job holds the token that writes to the pull request
+      # and runs nothing from the repository. It receives only the names-only
+      # summary and fixed text.
+      - name: Post or update the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          GATE: ${{ needs.gate.outputs.result }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          BODY: ${{ needs.plan.outputs.body }}
+        run: |
+          set -euo pipefail
+          marker='<!-- caersid-terraform-plan -->'
+          note() { BODY=$(printf '%s\n### Terraform plan (#588)\n\n%s Any earlier plan shown here is out of date.\n\n<sub>[run](%s)</sub>' "$marker" "$1" "$RUN_URL"); }
+          if [ "$GATE_RESULT" != success ]; then
+            note "**The plan gate did not succeed ($GATE_RESULT), so nothing was planned.** Read the run."
+          else
+            case $GATE in
+              ok) ;;
+              rerun) note "**Not planned: re-runs are never planned.** Push again to plan." ;;
+              person) note "**Not planned: only George's own pull requests and pushes are planned in CI.** George plans this one locally." ;;
+              base) note "**Not planned: this pull request is not based on \`main\`.** Retarget it to \`main\`, then push again." ;;
+              commits) note "**Not planned: a commit in this pull request is not a signed commit of a person** (author and committer linked to GitHub accounts of type User, committer not web-flow, signature verified). George plans it locally, or rebases it and pushes signed commits; \"Update branch\" in the GitHub UI makes a web-flow commit, which this refuses." ;;
+              pushes) note "**Not planned: the branch's push history does not prove that George pushed every commit** (read the run for the reason). George plans it locally." ;;
+              *) note "**Not planned: the plan gate gave no result.** Read the run." ;;
+            esac
+          fi
+          if [ "$GATE_RESULT" = success ] && [ "$GATE" = ok ]; then
+            if [ "$PLAN_RESULT" != success ] && [ -n "$BODY" ]; then
+              BODY=$(printf '%s\n\n**The plan job did not succeed (%s): read the run.**' "$BODY" "$PLAN_RESULT")
+            elif [ "$PLAN_RESULT" != success ]; then
+              note "**The plan job did not succeed ($PLAN_RESULT).** Read the run."
+            fi
+          fi
+          ids=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- caersid-terraform-plan -->"))) | .id')
+          id=${ids%%$'\n'*}
+          if [ -z "$BODY" ]; then
+            [ -n "$id" ] || exit 0
+            BODY=$(printf '%s\n### Terraform plan (#588)\n\nThis pull request no longer changes a Terraform tier.\n\n<sub>[run](%s)</sub>' "$marker" "$RUN_URL")
+          fi
+          printf '%s\n' "$BODY" > "$RUNNER_TEMP/body.md"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@"$RUNNER_TEMP/body.md" --silent
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@"$RUNNER_TEMP/body.md" --silent
+          fi
