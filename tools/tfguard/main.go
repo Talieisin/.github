@@ -24,8 +24,13 @@
 //     without comments or layout, as a multiset, whichever file holds them),
 //     and so is everything they reference, transitively: variable blocks
 //     (their defaults included), locals, data sources and resources.
-//   - In every block the pull request adds or changes (one whose canonical
-//     form is not among main's):
+//   - Every block label is an identifier. No *.tftest.*, *.tfmock.*,
+//     *.tfquery.* file, no tests directory, no dot-named configuration.
+//   - When any block calls a file-reading function, every other file of the
+//     tier (templates, payloads) is byte-identical to main's.
+//   - A block is TAINTED when the pull request adds or changes it (its
+//     canonical form is not among main's) or when anything it references,
+//     transitively, is tainted. In every tainted block:
 //   - no provider-defined function (name containing "::") and no
 //     function that reads files (file, fileset, templatefile, ...);
 //   - count and for_each reference nothing (no variable, local,
@@ -33,7 +38,9 @@
 //   - a data source is not external, http, terraform_remote_state or
 //     azurerm_key_vault_encrypted_value, and its type is one main already
 //     uses; nested data sources in a check block likewise;
-//   - no ephemeral, action, module or unknown block type.
+//   - no ephemeral, action, module, import, moved, removed, check or
+//     unknown block, and no precondition or postcondition;
+//   - a resource's type is one main already uses.
 package main
 
 import (
@@ -161,28 +168,60 @@ func check(tier, headRoot, baseRoot string) (string, error) {
 		queue = append(queue, h.refs...)
 	}
 
-	// Blocks the pull request adds or changes.
+	// Templates and payloads: frozen when any block reads files.
+	if hm.readsFiles {
+		if err := sameOtherFiles(head, base); err != nil {
+			return "", err
+		}
+	}
+
+	// Tainted blocks: changed by the pull request, or referencing one,
+	// transitively.
 	baseCanon := map[string]int{}
-	baseDataTypes := map[string]bool{}
 	for _, it := range bm.items {
 		baseCanon[it.canon]++
-	}
-	for _, t := range bm.dataTypes {
-		baseDataTypes[t] = true
 	}
 	ids := make([]string, 0, len(hm.items))
 	for id := range hm.items {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	tainted := map[string]bool{}
 	for _, id := range ids {
 		it := hm.items[id]
 		if baseCanon[it.canon] > 0 {
 			baseCanon[it.canon]--
 			continue
 		}
-		if err := checkChanged(id, it, baseDataTypes); err != nil {
-			return "", err
+		tainted[id] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, id := range ids {
+			if tainted[id] {
+				continue
+			}
+			for _, r := range hm.items[id].refs {
+				if tainted[r] || r == "module" {
+					tainted[id] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	main := mainTypes{data: map[string]bool{}, resource: map[string]bool{}}
+	for _, t := range bm.dataTypes {
+		main.data[t] = true
+	}
+	for _, t := range bm.resourceTypes {
+		main.resource[t] = true
+	}
+	for _, id := range ids {
+		if tainted[id] {
+			if err := checkTainted(id, hm.items[id], main); err != nil {
+				return "", err
+			}
 		}
 	}
 	return fmt.Sprintf("ok: the %s tier's rules hold", tier), nil
@@ -210,7 +249,7 @@ func checkTree(root string) error {
 		case t&fs.ModeSymlink != 0:
 			return refuse("the tier contains a symbolic link.")
 		case d.IsDir():
-			if name == "terraform.d" || name == ".terraform" {
+			if name == "terraform.d" || name == ".terraform" || name == "tests" {
 				return refuse("the tier has a %s directory.", name)
 			}
 			return nil
@@ -226,6 +265,14 @@ func checkTree(root string) error {
 		}
 		if depth == 0 && config && !strings.HasSuffix(name, ".tf") {
 			return refuse("the tier has %s: JSON and .tofu configuration are never planned in CI.", name)
+		}
+		for _, s := range []string{".tftest.hcl", ".tftest.json", ".tfmock.hcl", ".tfmock.json", ".tfquery.hcl", ".tfquery.json"} {
+			if strings.HasSuffix(name, s) {
+				return refuse("the tier has a Terraform test, mock or query file, %s. Those are never planned in CI.", name)
+			}
+		}
+		if depth == 0 && config && strings.HasPrefix(name, ".") {
+			return refuse("the tier has dot-named configuration, %s.", name)
 		}
 		if depth == 0 && (name == "override.tf" || strings.HasSuffix(name, "_override.tf")) {
 			return refuse("the tier has an override file, %s.", name)
@@ -288,11 +335,17 @@ type item struct {
 }
 
 type model struct {
-	frozen       []string
-	frozenBlocks []*hclsyntax.Block
-	items        map[string]*item
-	dataTypes    []string
+	frozen        []string
+	frozenBlocks  []*hclsyntax.Block
+	items         map[string]*item
+	dataTypes     []string
+	resourceTypes []string
+	readsFiles    bool
 }
+
+type mainTypes struct{ data, resource map[string]bool }
+
+var identifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
 // load parses every root .tf file of a tier. isHead: a refusal rather than an
 // error when something is wrong (main is trusted to parse).
@@ -332,6 +385,15 @@ func load(dir string, isHead bool) (*model, error) {
 			return nil, fail("%s has an attribute at the top level.", name)
 		}
 		for _, b := range body.Blocks {
+			if err := checkLabels(b); err != nil {
+				if isHead {
+					return nil, err
+				}
+				return nil, fmt.Errorf("main: %v", err)
+			}
+			if callsFileFunction(b) {
+				m.readsFiles = true
+			}
 			canon, err := canonBlock(b, src)
 			if err != nil {
 				return nil, fail("%s: %v", name, err)
@@ -369,6 +431,8 @@ func load(dir string, isHead bool) (*model, error) {
 				id := b.Labels[0] + "." + b.Labels[1]
 				if b.Type == "ephemeral" {
 					id = "ephemeral." + id
+				} else {
+					m.resourceTypes = append(m.resourceTypes, b.Labels[0])
 				}
 				if err := add(id, &item{kind: b.Type, canon: canon, refs: refsOf(b), node: b, block: b}); err != nil {
 					return nil, err
@@ -526,18 +590,25 @@ func equalMultiset(a, b []string) bool {
 	return true
 }
 
-// checkChanged: the rules for a block the pull request adds or changes.
-func checkChanged(id string, it *item, baseDataTypes map[string]bool) error {
+// checkTainted: the rules for a block the pull request adds or changes, or
+// one that references such a block.
+func checkTainted(id string, it *item, main mainTypes) error {
 	switch it.kind {
-	case "data", "resource", "variable", "output", "check", "local", "import", "moved", "removed":
+	case "data", "resource", "variable", "output", "local":
 	case "ephemeral":
 		return refuse("the pull request adds or changes an ephemeral resource. Those are never planned in CI.")
 	default:
-		return refuse("the pull request adds or changes a %s block, which this check does not plan.", it.kind)
+		return refuse("the pull request adds or changes a %s block, or one it depends on. Those are never planned in CI.", it.kind)
 	}
-	if it.kind == "data" {
+	baseDataTypes := main.data
+	switch it.kind {
+	case "data":
 		if err := checkData(it.block.Labels[0], baseDataTypes); err != nil {
 			return err
+		}
+	case "resource":
+		if !main.resource[it.block.Labels[0]] {
+			return refuse("the pull request adds a %s resource, a type main does not use. New resource types are never planned in CI.", it.block.Labels[0])
 		}
 	}
 	var verr error
@@ -553,12 +624,8 @@ func checkChanged(id string, it *item, baseDataTypes map[string]bool) error {
 				verr = refuse("%s calls %s(), which reads files. That is never planned in CI.", id, x.Name)
 			}
 		case *hclsyntax.Block:
-			if x.Type == "data" && it.kind == "check" {
-				if len(x.Labels) != 2 {
-					verr = refuse("%s has a data block without two labels.", id)
-				} else if err := checkData(x.Labels[0], baseDataTypes); err != nil {
-					verr = err
-				}
+			if x.Type == "precondition" || x.Type == "postcondition" {
+				verr = refuse("%s has a %s, whose outcome can depend on any value. Those are never planned in CI when the pull request changes them.", id, x.Type)
 			}
 		}
 		return nil
@@ -582,6 +649,79 @@ func checkData(typ string, baseDataTypes map[string]bool) error {
 	}
 	if !baseDataTypes[typ] {
 		return refuse("the pull request adds a %s data source, a type main does not use. New data source types are never planned in CI.", typ)
+	}
+	return nil
+}
+
+// checkLabels: every label of a block, and of its nested blocks, is an
+// identifier, so no reason built from one can carry anything else.
+func checkLabels(b *hclsyntax.Block) error {
+	for _, l := range b.Labels {
+		if !identifier.MatchString(l) {
+			return refuse("a %s block has a label that is not an identifier.", b.Type)
+		}
+	}
+	for _, nb := range b.Body.Blocks {
+		if err := checkLabels(nb); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func callsFileFunction(b *hclsyntax.Block) bool {
+	found := false
+	hclsyntax.VisitAll(b, func(n hclsyntax.Node) hcl.Diagnostics {
+		if f, ok := n.(*hclsyntax.FunctionCallExpr); ok && fileFunctions[f.Name] {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+// sameOtherFiles: every regular file of the tier that is not root .tf
+// configuration (templates, payloads, anything a file function could read)
+// is byte-identical to main's, and neither side has one the other lacks.
+func sameOtherFiles(head, base string) error {
+	list := func(root string) (map[string]bool, error) {
+		out := map[string]bool{}
+		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			rel, _ := filepath.Rel(root, p)
+			if !strings.Contains(rel, string(filepath.Separator)) && strings.HasSuffix(rel, ".tf") {
+				return nil
+			}
+			out[rel] = true
+			return nil
+		})
+		return out, err
+	}
+	h, err := list(head)
+	if err != nil {
+		return err
+	}
+	b, err := list(base)
+	if err != nil {
+		return err
+	}
+	for rel := range b {
+		h[rel] = true
+	}
+	names := make([]string, 0, len(h))
+	for rel := range h {
+		names = append(names, rel)
+	}
+	sort.Strings(names)
+	for _, rel := range names {
+		if err := sameBytes(filepath.Join(head, rel), filepath.Join(base, rel), rel); err != nil {
+			return refuse("%s differs from main's, and the configuration reads files. Changed templates and payloads are never planned in CI.", rel)
+		}
 	}
 	return nil
 }

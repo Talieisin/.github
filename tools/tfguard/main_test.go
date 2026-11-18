@@ -49,6 +49,20 @@ resource "azurerm_storage_blob" "serve" {
   name   = "serve.json"
   source = "${path.module}/files/serve.json"
 }
+
+resource "azurerm_storage_container" "web" {
+  count = local.containers
+  name  = "web"
+}
+
+resource "azurerm_role_assignment" "reader" {
+  scope        = azurerm_storage_account.this.id
+  principal_id = data.azurerm_client_config.current.object_id
+}
+
+locals {
+  containers = 1
+}
 `,
 	"compute/variables.tf":                   "variable \"subscription_id\" {\n  type    = string\n  default = \"sub\"\n}\n\nlocals {\n  subscription_id = var.subscription_id\n}\n",
 	"compute/files/serve.json":               "{}\n",
@@ -138,6 +152,12 @@ func TestPlanned(t *testing.T) {
 		},
 		"an output and a local that use data": func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  rg = local.platform.resource_group_name\n}\noutput \"e\" {\n  value = azurerm_storage_account.this.primary_web_endpoint\n}\n")
+		},
+		"a payload file changes when nothing reads files": func(t *testing.T, head string) {
+			write(t, head, map[string]string{"compute/files/serve.json": "{\"v\": 2}\n"})
+		},
+		"an unchanged count fed by an unchanged local": func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\n# a comment only\n")
 		},
 		"a variable unrelated to the provider changes": func(t *testing.T, head string) {
 			appendTo(t, head, "compute/variables.tf", "\nvariable \"other\" {\n  default = \"x\"\n}\n")
@@ -251,7 +271,7 @@ func TestRefused(t *testing.T) {
 		{"a data source type main does not use", "a type main does not use", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\ndata \"azurerm_key_vault_secret\" \"x\" {\n  name = \"s\"\n}\n")
 		}},
-		{"a data source in a check block", "external data source", func(t *testing.T, head string) {
+		{"a data source in a check block", "check block", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\ncheck \"c\" {\n  data \"external\" \"x\" {}\n  assert {\n    condition     = true\n    error_message = \"x\"\n  }\n}\n")
 		}},
 		{"an ephemeral resource", "ephemeral resource", func(t *testing.T, head string) {
@@ -266,10 +286,49 @@ func TestRefused(t *testing.T) {
 		{"a changed resource gains a count from a value", "count that references", func(t *testing.T, head string) {
 			replaceIn(t, head, "compute/storage.tf", "name = \"st\"", "name  = \"st\"\n  count = length(var.other)")
 		}},
+		{"an unchanged count fed by a changed local", "count that references", func(t *testing.T, head string) {
+			replaceIn(t, head, "compute/storage.tf", "containers = 1", "containers = length(azurerm_storage_account.this.primary_access_key)")
+		}},
+		{"a new resource type", "a type main does not use", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_key_vault\" \"k\" {\n  name = \"k\"\n}\n")
+		}},
+		{"an import block", "import block", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nimport {\n  to = azurerm_storage_account.this\n  id = \"x\"\n}\n")
+		}},
+		{"a moved block", "moved block", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nmoved {\n  from = azurerm_storage_account.old\n  to   = azurerm_storage_account.this\n}\n")
+		}},
+		{"a removed block", "removed block", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nremoved {\n  from = azurerm_storage_account.old\n}\n")
+		}},
+		{"a check block", "check block", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\ncheck \"c\" {\n  assert {\n    condition     = azurerm_storage_account.this.name == \"st\"\n    error_message = \"x\"\n  }\n}\n")
+		}},
+		{"a precondition in a changed resource", "precondition", func(t *testing.T, head string) {
+			replaceIn(t, head, "compute/storage.tf", "name = \"st\"", "name = \"st\"\n  lifecycle {\n    precondition {\n      condition     = true\n      error_message = \"x\"\n    }\n  }")
+		}},
+		{"a postcondition in a new output", "postcondition", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\noutput \"o\" {\n  value = 1\n  postcondition {\n    condition     = true\n    error_message = \"x\"\n  }\n}\n")
+		}},
+		{"a label that is not an identifier", "not an identifier", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\ndata \"x\\n::error title=Plan::approved\" \"y\" {}\n")
+		}},
+		{"a test file", "test, mock or query file", func(t *testing.T, head string) {
+			write(t, head, map[string]string{"compute/a.tftest.hcl": "run \"a\" {}\n"})
+		}},
+		{"a tests directory", "tests directory", func(t *testing.T, head string) {
+			write(t, head, map[string]string{"compute/tests/readme.md": "x\n"})
+		}},
+		{"dot-named configuration", "dot-named configuration", func(t *testing.T, head string) {
+			write(t, head, map[string]string{"compute/.x.tf": "locals {}\n"})
+		}},
+		{"a resource fed by a tainted local", "a type main does not use", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  n = \"x\"\n}\nresource \"azurerm_key_vault\" \"k\" {\n  name = local.n\n}\n")
+		}},
 		{"an attribute at the top level", "attribute at the top level", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nx = 1\n")
 		}},
-		{"an unknown block type", "does not plan", func(t *testing.T, head string) {
+		{"an unknown block type", "action block", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\naction \"x\" \"y\" {}\n")
 		}},
 	}
@@ -295,5 +354,28 @@ func TestErrors(t *testing.T) {
 	write(t, filepath.Join(dir, "head"), baseFiles)
 	if _, err := check("compute", filepath.Join(dir, "head"), filepath.Join(dir, "nobase")); err == nil {
 		t.Fatal("a missing base must be an error")
+	}
+}
+
+// When main's configuration reads files, every other file is frozen.
+func TestTemplatesFrozen(t *testing.T) {
+	dir := t.TempDir()
+	base, head := filepath.Join(dir, "base"), filepath.Join(dir, "head")
+	files := map[string]string{}
+	for k, v := range baseFiles {
+		files[k] = v
+	}
+	files["compute/templates.tf"] = "locals {\n  page = templatefile(\"${path.module}/files/page.tftpl\", {})\n}\n"
+	files["compute/files/page.tftpl"] = "hello\n"
+	write(t, base, files)
+	write(t, head, files)
+	if msg, err := check("compute", head, base); err != nil {
+		t.Fatalf("unchanged: want ok, got %q, %v", msg, err)
+	}
+	write(t, head, map[string]string{"compute/files/page.tftpl": "${file(\"/proc/self/environ\")}\n"})
+	_, err := check("compute", head, base)
+	var r refusal
+	if !errors.As(err, &r) || !strings.Contains(r.msg, "files/page.tftpl differs") {
+		t.Fatalf("a changed template: want a refusal, got %v", err)
 	}
 }

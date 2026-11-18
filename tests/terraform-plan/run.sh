@@ -6,7 +6,10 @@
 #   - the gate's commit check (jq);
 #   - plan-summary.sh: names only, instance keys hidden;
 #   - mint-token.sh: audience and subject checks, the 0600 file;
-#   - plan-tier.sh: refuses to start with the ID token request variables;
+#   - plan-tier.sh and prepare-tiers.sh: refuse to start with the ID token
+#     request variables or a GitHub token;
+#   - the workflow: no job runs an action, and only the plan job holds
+#     id-token: write;
 #   - tfguard (the HCL rules): the copy embedded in the workflow is
 #     tools/tfguard, byte for byte, and its Go tests pass.
 # Also shellchecks every extracted script (a missing shellcheck or go fails).
@@ -40,7 +43,7 @@ extract() { # <name>: the heredoc that writes $bin/<name>.sh
   [ -s "$work/$1.sh" ] || { echo "could not extract $1.sh" >&2; exit 2; }
   chmod +x "$work/$1.sh"
 }
-for s in mint-token plan-summary check-identity plan-tier; do extract "$s"; done
+for s in mint-token prepare-tiers plan-summary check-identity plan-tier; do extract "$s"; done
 
 gate=$(yq '.jobs.gate.steps[0].run' "$wf")
 verdict_prog=$(awk '
@@ -150,6 +153,8 @@ expect "mint: the default subject" 5 "$(mint "$(jq -c '.sub = "repo:Talieisin/ca
 expect "mint: another workflow file" 5 "$(mint "$(jq -c '.job_workflow_ref = "Talieisin/.github/.github/workflows/other.yml@x" | .sub = ("repo:Talieisin/caersid:pull_request:job_workflow_ref:" + .job_workflow_ref)' <<<"$good")")"
 expect "mint: another repository" 5 "$(mint "$(jq -c '.repository = "Talieisin/other"' <<<"$good")")"
 expect "mint: another event" 5 "$(mint "$(jq -c '.event_name = "push"' <<<"$good")")"
+expect "mint: a branch ref, not the commit id" 5 "$(mint "$(jq -c '.job_workflow_ref = "Talieisin/.github/.github/workflows/terraform-plan.yml@refs/heads/main" | .sub = ("repo:Talieisin/caersid:pull_request:job_workflow_ref:" + .job_workflow_ref)' <<<"$good")")"
+expect "mint: a ref with another commit id" 5 "$(mint "$(jq -c '.job_workflow_sha = "ffffffffffffffffffffffffffffffffffffffff"' <<<"$good")")"
 rc=0; PATH="$fake:$PATH" "$work/mint-token.sh" "$work/token" > /dev/null 2>&1 || rc=$?
 expect "mint: no request variables" 5 "$rc"
 
@@ -157,6 +162,16 @@ expect "mint: no request variables" 5 "$rc"
 : > "$work/jwt"
 rc=0; RUNNER_TEMP=$work ACTIONS_ID_TOKEN_REQUEST_URL=x "$work/plan-tier.sh" platform "$work/s.md" "$work/jwt" > /dev/null 2>&1 || rc=$?
 expect "plan-tier: refuses the request variables" 2 "$rc"
+rc=0; RUNNER_TEMP=$work GH_TOKEN=x "$work/plan-tier.sh" platform "$work/s.md" "$work/jwt" > /dev/null 2>&1 || rc=$?
+expect "plan-tier: refuses a GitHub token" 2 "$rc"
+rc=0; RUNNER_TEMP=$work ACTIONS_ID_TOKEN_REQUEST_TOKEN=x "$work/prepare-tiers.sh" > /dev/null 2>&1 || rc=$?
+expect "prepare-tiers: refuses the request variables" 2 "$rc"
+
+# --- The workflow's shape ----------------------------------------------------------
+actions=$(yq '[.jobs[].steps[] | select(has("uses"))] | length' "$wf")
+expect "workflow: no step runs an action" 0 "$actions"
+idjobs=$(yq '[.jobs | to_entries[] | select(.value.permissions["id-token"] == "write") | .key] | join(",")' "$wf")
+expect "workflow: only the plan job holds id-token" plan "$idjobs"
 
 # --- tfguard ---------------------------------------------------------------------
 gosrc=$(yq '.jobs.prepare.steps[] | select(.name == "Build tfguard") | .run' "$wf")

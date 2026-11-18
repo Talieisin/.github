@@ -31,39 +31,48 @@ name: Terraform plan (pinned)
 #             George's account (by numeric id), not web-flow;
 #           - every push to the branch, back to its creation, by George
 #             (activity API, a strict chain: anything unprovable refuses).
-#   prepare no id-token permission, so nothing in it can mint. Checks out the
-#           pushed head (never a merge), and per tier runs tfguard: an HCL
-#           parser (hashicorp/hcl/v2, source below and in tools/tfguard) that
-#           refuses links, odd names, nested or JSON configuration, modules,
-#           any terraform, provider or remote-state block unlike main's (and
-#           anything they reference, transitively), changed lock or variable
-#           files, and, in blocks the pull request changes, file-reading and
-#           provider-defined functions, non-literal count or for_each and
-#           risky data sources. Then copies the tier with main's lock file,
-#           installs a checksummed Terraform and runs init. Hands one archive
-#           and its SHA-256 to the plan job.
-#   plan    the only job with id-token: write, and only on run attempt 1. No
-#           checkout, no az, no init. Per tier: mints one ID token into a 0600
-#           file (audience and exact subject checked), execs into the plan
-#           without ACTIONS_ID_TOKEN_REQUEST_*, gets Entra tokens with the file
-#           (client assertion), checks the identity, fetches the state, runs
-#           terraform plan in a clean environment (token file only; no CLI or
-#           MSI sign-in) and deletes the file and the state copy. The summary
-#           is names only, with instance keys hidden.
-#   comment posts the summaries or the reasons on the pull request. No
-#           checkout; it runs nothing from the repository.
+#   prepare no id-token permission and no action: only this file's code. Fetches
+#           the pushed head and main by commit id (never a merge), builds
+#           tfguard (an HCL parser on hashicorp/hcl/v2, source below and in
+#           tools/tfguard) with a checksummed Go, and hands the plan job one
+#           verdict per tier. tfguard refuses odd names, links, test files,
+#           nested or JSON configuration and modules; any terraform, provider
+#           or remote-state block unlike main's, and anything they reference;
+#           changed lock, variable or (when configuration reads files)
+#           template files; and in every TAINTED block (changed by the pull
+#           request, or depending on one that is): file-reading and
+#           provider-defined functions, non-literal count or for_each, risky
+#           or new data source types, new resource types, import, moved,
+#           removed, check, ephemeral and unknown blocks, and pre- and
+#           postconditions.
+#   plan    the only job with id-token: write, and only on run attempt 1; no
+#           action, only this file's code. Fetches the same two commits by
+#           id, installs a checksummed Terraform, and runs init (main's lock,
+#           read-only) in a step that execs without ACTIONS_ID_TOKEN_REQUEST_*.
+#           Per tier: rechecks that main has not moved, mints one ID token
+#           into a 0600 file (audience, and a subject naming this file at its
+#           own commit id, checked), execs into the plan without the request
+#           variables or a GitHub token, gets Entra tokens with the file,
+#           checks the identity, fetches the state, runs terraform plan in a
+#           clean environment (token file only; no CLI or MSI sign-in), and
+#           deletes the file and the state copy. Names-only summary.
+#   comment posts the summaries or the reasons on the pull request, unless
+#           main moved during the run. No checkout; it runs nothing from the
+#           repository.
 #
-# Residual George accepted (caersid G3, 2026-11-18): the pull request's own
-# Terraform is evaluated in the plan job while the token file exists. The
-# rules leave it main's providers, backend and remote state, no file-reading
-# functions and no risky data sources in changed code; the gate admits only
-# George's own pushes. Known to remain: Terraform can read the token file and
-# the state copy (a replay is bounded by the token's lifetime and the plan
-# identity), azurerm resources main already uses may send requests to a host
-# their arguments name, and the summary's rows show which resources change.
+# Residual George accepted (caersid G3, 2026-11-18, and again for #44 on the
+# same day): the pull request's own Terraform is evaluated while the token
+# file exists, and code George pushes can make the plan's outcome depend on
+# a value. Known to remain:
+#   - Terraform can read the token file (a replay is bounded by the token's
+#     lifetime and the plan identity) and the state copy;
+#   - azurerm resource types main already uses may send requests to a host
+#     their arguments name;
+#   - plan success or failure, the failure class, which resources change,
+#     how many rows (instances) there are and which outputs change can each
+#     carry a bit from a value.
 # What any channel can reach is what the plan identity can: both state files,
 # the Tailscale storage key and log queries.
-
 # Caller contract (caersid's .github/workflows/terraform-plan.yml):
 #   on: pull_request (opened, synchronize, reopened), never pull_request_target;
 #   permissions: contents read, pull-requests write, id-token write;
@@ -100,9 +109,6 @@ env:
   # george-elphick-talieisin (numeric id: a login can be renamed and reused).
   PLAN_PERSON_ID: "146720324"
   PLAN_REPO: Talieisin/caersid
-  TF_IN_AUTOMATION: "1"
-  TF_INPUT: "0"
-  CHECKPOINT_DISABLE: "1"
 
 jobs:
   gate:
@@ -177,11 +183,17 @@ jobs:
           cmp=$(gh api "repos/$REPO/compare/$HEAD_SHA...$main_sha") || fail "the head could not be compared with main"
           ahead=$(jq -er '.ahead_by | numbers' <<<"$cmp" 2>/dev/null) || fail "the comparison with main has no count"
           if [ "$ahead" -gt 0 ]; then
-            nfiles=$(jq -r '.files | length' <<<"$cmp")
+            nfiles=$(jq -er '.files | length' <<<"$cmp" 2>/dev/null) || fail "the comparison with main has no file list"
             [ "$nfiles" -lt 300 ] || refuse behind "main has more changes since this branch than the API lists, so it cannot tell whether they touch Terraform. Rebase onto main and push again."
-            if jq -e 'any(.files[]; .filename | startswith("infrastructure/terraform/"))' <<<"$cmp" > /dev/null; then
-              refuse behind "main has Terraform changes this branch does not have. Rebase it onto main locally and push again."
-            fi
+            # A file main moved counts by its old name too. jq: 0 a match,
+            # 1 none, anything else an error (fail).
+            rc=0
+            jq -e 'any(.files[]; ((.filename // "") | startswith("infrastructure/terraform/")) or ((.previous_filename // "") | startswith("infrastructure/terraform/")))' <<<"$cmp" > /dev/null 2>&1 || rc=$?
+            case $rc in
+              0) refuse behind "main has Terraform changes this branch does not have. Rebase it onto main locally and push again." ;;
+              1) ;;
+              *) fail "the comparison with main could not be read" ;;
+            esac
           fi
 
           # Every commit a signed commit of George's (caersid G1, G2, bound to the
@@ -254,10 +266,10 @@ jobs:
             echo "main-sha=$main_sha"
           } >> "$GITHUB_OUTPUT"
 
-  # Everything that reads the pull request runs here, in a job that holds no
-  # id-token permission, so nothing in it can mint an Azure token: the
-  # checkout, the rules (tfguard, an HCL parser), the Terraform install and
-  # init. It hands the plan job one archive and its SHA-256.
+  # The rules, in a job that holds no id-token permission and runs no action:
+  # every step is this file's own code. It fetches the pushed head and main
+  # by commit id, builds tfguard (an HCL parser) with a checksummed Go, and
+  # hands the plan job one verdict per tier.
   prepare:
     needs: gate
     if: >-
@@ -275,43 +287,33 @@ jobs:
       compute: ${{ steps.tiers.outputs.compute }}
       identity: ${{ steps.tiers.outputs.identity }}
       harness: ${{ steps.tiers.outputs.harness }}
-      platform-state: ${{ steps.prepare.outputs.platform-state }}
-      compute-state: ${{ steps.prepare.outputs.compute-state }}
-      platform-note: ${{ steps.prepare.outputs.platform-note }}
-      compute-note: ${{ steps.prepare.outputs.compute-note }}
-      ready: ${{ steps.prepare.outputs.ready }}
-      digest: ${{ steps.package.outputs.digest }}
+      platform-state: ${{ steps.rules.outputs.platform-state }}
+      compute-state: ${{ steps.rules.outputs.compute-state }}
+      platform-note: ${{ steps.rules.outputs.platform-note }}
+      compute-note: ${{ steps.rules.outputs.compute-note }}
+      ready: ${{ steps.rules.outputs.ready }}
     env:
+      REPO: ${{ github.repository }}
       HEAD_SHA: ${{ needs.gate.outputs.head-sha }}
       MAIN_SHA: ${{ needs.gate.outputs.main-sha }}
       PLAN_CLIENT_ID: f021a221-0d35-4931-bf82-06144ff184a2
       PLAN_TENANT_ID: 79f0cb1a-28e2-448a-858b-8d37bb32bd24
     steps:
-      # The pull request's head, exactly; main's history with it, for the
-      # rules' baseline. Into pr/, never the working directory.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.gate.outputs.head-sha }}
-          path: pr
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Check the checkout is the gated head
-        run: |
-          set -euo pipefail
-          [ "$(git -C pr rev-parse HEAD)" = "$HEAD_SHA" ] || { echo "::error::the checkout is not the gated head"; exit 1; }
-          git -C pr cat-file -e "$MAIN_SHA^{commit}" || { echo "::error::main's gated commit is not in the checkout"; exit 1; }
-
-      # Which tiers the pull request changes: the head against its merge base
-      # with main (names only; no renames, no textconv, no attributes). An
+      # Which tiers the pull request changes: main's merge base against the
+      # head, from the API (names, and the names renamed files had). An
       # unmapped path under infrastructure/terraform/ fails the job, so a new
       # tier cannot go unplanned silently. A change to caersid's caller of
       # this workflow plans both tiers.
       - name: Find the changed tiers
         id: tiers
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git -C pr -c core.attributesFile=/dev/null diff --no-renames --no-textconv --name-only "$MAIN_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed.txt"
+          cmp=$(gh api "repos/$REPO/compare/$MAIN_SHA...$HEAD_SHA") || { echo "::error::the head could not be compared with main"; exit 1; }
+          n=$(jq -er '.files | length' <<<"$cmp") || { echo "::error::the comparison has no file list"; exit 1; }
+          [ "$n" -lt 300 ] || { echo "::error::the pull request changes more files than the API lists; nothing is planned"; exit 1; }
+          jq -r '.files[] | .filename, (.previous_filename // empty)' <<<"$cmp" > "$RUNNER_TEMP/changed.txt"
           tf=infrastructure/terraform
           platform=false compute=false identity=false harness=false unmapped=
           while IFS= read -r path; do
@@ -322,12 +324,12 @@ jobs:
               "$tf/identity/"* | "$tf/environments/local.tfvars" | "$tf/environments/production.tfvars") identity=true ;;
               .github/workflows/terraform-plan.yml) harness=true ;;
               "$tf/scripts/"*) ;;
-              "$tf/"*) unmapped="$unmapped $path" ;;
+              "$tf/"*) unmapped="$unmapped x" ;;
               *) ;;
             esac
           done < "$RUNNER_TEMP/changed.txt"
           if [ -n "$unmapped" ]; then
-            echo "::error title=Unmapped Terraform path::path(s) under $tf/ that map to no tier. Map them in Talieisin/.github's terraform-plan.yml."
+            echo "::error title=Unmapped Terraform path::a path under $tf/ maps to no tier. Map it in Talieisin/.github's terraform-plan.yml."
             exit 1
           fi
           plan_platform=false plan_compute=false
@@ -361,22 +363,36 @@ jobs:
           fi
           echo "state=$state" >> "$GITHUB_OUTPUT"
 
-      # tfguard, built from the source below (also in tools/tfguard, which
-      # tests/terraform-plan/run.sh checks is the same text). Go and the HCL
-      # modules are pinned (go.sum); no cache.
-      - if: steps.decide.outputs.state == 'planned'
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.26.10"
-          cache: false
-
-      - name: Build tfguard
+      - name: Fetch the head and main
         if: steps.decide.outputs.state == 'planned'
         env:
-          GOFLAGS: -mod=readonly
-          GOTOOLCHAIN: local
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # By commit id: git verifies every object it receives against its id. The
+          # token goes in through the environment, never an argument.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          repo="$RUNNER_TEMP/repo"
+          git init -q "$repo"
+          git -C "$repo" fetch -q --no-tags --depth=1 "https://github.com/$REPO" "$HEAD_SHA" "$MAIN_SHA"
+          mkdir -p "$RUNNER_TEMP/head" "$RUNNER_TEMP/base"
+          git -C "$repo" archive --format=tar "$HEAD_SHA" infrastructure/terraform | tar -x -C "$RUNNER_TEMP/head"
+          git -C "$repo" archive --format=tar "$MAIN_SHA" infrastructure/terraform | tar -x -C "$RUNNER_TEMP/base"
+          rm -rf "$repo"
+          echo "ok: the head and main fetched"
+
+      # Go from go.dev, checked against the SHA-256 recorded here; the HCL
+      # modules are checked by go.sum. No cache.
+      - name: Build tfguard
+        if: steps.decide.outputs.state == 'planned'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 --max-time 300 -o go.tgz https://go.dev/dl/go1.26.10.linux-amd64.tar.gz
+          got=$(sha256sum go.tgz)
+          [ "${got%% *}" = ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5 ] || { echo "::error::Go checksum mismatch"; exit 1; }
+          tar -xzf go.tgz && rm go.tgz
           src="$RUNNER_TEMP/tfguard-src"
           mkdir -p "$src"
           cat > "$src/go.mod" <<'GOSRC'
@@ -455,8 +471,13 @@ jobs:
           //     without comments or layout, as a multiset, whichever file holds them),
           //     and so is everything they reference, transitively: variable blocks
           //     (their defaults included), locals, data sources and resources.
-          //   - In every block the pull request adds or changes (one whose canonical
-          //     form is not among main's):
+          //   - Every block label is an identifier. No *.tftest.*, *.tfmock.*,
+          //     *.tfquery.* file, no tests directory, no dot-named configuration.
+          //   - When any block calls a file-reading function, every other file of the
+          //     tier (templates, payloads) is byte-identical to main's.
+          //   - A block is TAINTED when the pull request adds or changes it (its
+          //     canonical form is not among main's) or when anything it references,
+          //     transitively, is tainted. In every tainted block:
           //   - no provider-defined function (name containing "::") and no
           //     function that reads files (file, fileset, templatefile, ...);
           //   - count and for_each reference nothing (no variable, local,
@@ -464,7 +485,9 @@ jobs:
           //   - a data source is not external, http, terraform_remote_state or
           //     azurerm_key_vault_encrypted_value, and its type is one main already
           //     uses; nested data sources in a check block likewise;
-          //   - no ephemeral, action, module or unknown block type.
+          //   - no ephemeral, action, module, import, moved, removed, check or
+          //     unknown block, and no precondition or postcondition;
+          //   - a resource's type is one main already uses.
           package main
 
           import (
@@ -592,28 +615,60 @@ jobs:
           		queue = append(queue, h.refs...)
           	}
 
-          	// Blocks the pull request adds or changes.
+          	// Templates and payloads: frozen when any block reads files.
+          	if hm.readsFiles {
+          		if err := sameOtherFiles(head, base); err != nil {
+          			return "", err
+          		}
+          	}
+
+          	// Tainted blocks: changed by the pull request, or referencing one,
+          	// transitively.
           	baseCanon := map[string]int{}
-          	baseDataTypes := map[string]bool{}
           	for _, it := range bm.items {
           		baseCanon[it.canon]++
-          	}
-          	for _, t := range bm.dataTypes {
-          		baseDataTypes[t] = true
           	}
           	ids := make([]string, 0, len(hm.items))
           	for id := range hm.items {
           		ids = append(ids, id)
           	}
           	sort.Strings(ids)
+          	tainted := map[string]bool{}
           	for _, id := range ids {
           		it := hm.items[id]
           		if baseCanon[it.canon] > 0 {
           			baseCanon[it.canon]--
           			continue
           		}
-          		if err := checkChanged(id, it, baseDataTypes); err != nil {
-          			return "", err
+          		tainted[id] = true
+          	}
+          	for changed := true; changed; {
+          		changed = false
+          		for _, id := range ids {
+          			if tainted[id] {
+          				continue
+          			}
+          			for _, r := range hm.items[id].refs {
+          				if tainted[r] || r == "module" {
+          					tainted[id] = true
+          					changed = true
+          					break
+          				}
+          			}
+          		}
+          	}
+          	main := mainTypes{data: map[string]bool{}, resource: map[string]bool{}}
+          	for _, t := range bm.dataTypes {
+          		main.data[t] = true
+          	}
+          	for _, t := range bm.resourceTypes {
+          		main.resource[t] = true
+          	}
+          	for _, id := range ids {
+          		if tainted[id] {
+          			if err := checkTainted(id, hm.items[id], main); err != nil {
+          				return "", err
+          			}
           		}
           	}
           	return fmt.Sprintf("ok: the %s tier's rules hold", tier), nil
@@ -641,7 +696,7 @@ jobs:
           		case t&fs.ModeSymlink != 0:
           			return refuse("the tier contains a symbolic link.")
           		case d.IsDir():
-          			if name == "terraform.d" || name == ".terraform" {
+          			if name == "terraform.d" || name == ".terraform" || name == "tests" {
           				return refuse("the tier has a %s directory.", name)
           			}
           			return nil
@@ -657,6 +712,14 @@ jobs:
           		}
           		if depth == 0 && config && !strings.HasSuffix(name, ".tf") {
           			return refuse("the tier has %s: JSON and .tofu configuration are never planned in CI.", name)
+          		}
+          		for _, s := range []string{".tftest.hcl", ".tftest.json", ".tfmock.hcl", ".tfmock.json", ".tfquery.hcl", ".tfquery.json"} {
+          			if strings.HasSuffix(name, s) {
+          				return refuse("the tier has a Terraform test, mock or query file, %s. Those are never planned in CI.", name)
+          			}
+          		}
+          		if depth == 0 && config && strings.HasPrefix(name, ".") {
+          			return refuse("the tier has dot-named configuration, %s.", name)
           		}
           		if depth == 0 && (name == "override.tf" || strings.HasSuffix(name, "_override.tf")) {
           			return refuse("the tier has an override file, %s.", name)
@@ -719,11 +782,17 @@ jobs:
           }
 
           type model struct {
-          	frozen       []string
-          	frozenBlocks []*hclsyntax.Block
-          	items        map[string]*item
-          	dataTypes    []string
+          	frozen        []string
+          	frozenBlocks  []*hclsyntax.Block
+          	items         map[string]*item
+          	dataTypes     []string
+          	resourceTypes []string
+          	readsFiles    bool
           }
+
+          type mainTypes struct{ data, resource map[string]bool }
+
+          var identifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
           // load parses every root .tf file of a tier. isHead: a refusal rather than an
           // error when something is wrong (main is trusted to parse).
@@ -763,6 +832,15 @@ jobs:
           			return nil, fail("%s has an attribute at the top level.", name)
           		}
           		for _, b := range body.Blocks {
+          			if err := checkLabels(b); err != nil {
+          				if isHead {
+          					return nil, err
+          				}
+          				return nil, fmt.Errorf("main: %v", err)
+          			}
+          			if callsFileFunction(b) {
+          				m.readsFiles = true
+          			}
           			canon, err := canonBlock(b, src)
           			if err != nil {
           				return nil, fail("%s: %v", name, err)
@@ -800,6 +878,8 @@ jobs:
           				id := b.Labels[0] + "." + b.Labels[1]
           				if b.Type == "ephemeral" {
           					id = "ephemeral." + id
+          				} else {
+          					m.resourceTypes = append(m.resourceTypes, b.Labels[0])
           				}
           				if err := add(id, &item{kind: b.Type, canon: canon, refs: refsOf(b), node: b, block: b}); err != nil {
           					return nil, err
@@ -957,18 +1037,25 @@ jobs:
           	return true
           }
 
-          // checkChanged: the rules for a block the pull request adds or changes.
-          func checkChanged(id string, it *item, baseDataTypes map[string]bool) error {
+          // checkTainted: the rules for a block the pull request adds or changes, or
+          // one that references such a block.
+          func checkTainted(id string, it *item, main mainTypes) error {
           	switch it.kind {
-          	case "data", "resource", "variable", "output", "check", "local", "import", "moved", "removed":
+          	case "data", "resource", "variable", "output", "local":
           	case "ephemeral":
           		return refuse("the pull request adds or changes an ephemeral resource. Those are never planned in CI.")
           	default:
-          		return refuse("the pull request adds or changes a %s block, which this check does not plan.", it.kind)
+          		return refuse("the pull request adds or changes a %s block, or one it depends on. Those are never planned in CI.", it.kind)
           	}
-          	if it.kind == "data" {
+          	baseDataTypes := main.data
+          	switch it.kind {
+          	case "data":
           		if err := checkData(it.block.Labels[0], baseDataTypes); err != nil {
           			return err
+          		}
+          	case "resource":
+          		if !main.resource[it.block.Labels[0]] {
+          			return refuse("the pull request adds a %s resource, a type main does not use. New resource types are never planned in CI.", it.block.Labels[0])
           		}
           	}
           	var verr error
@@ -984,12 +1071,8 @@ jobs:
           				verr = refuse("%s calls %s(), which reads files. That is never planned in CI.", id, x.Name)
           			}
           		case *hclsyntax.Block:
-          			if x.Type == "data" && it.kind == "check" {
-          				if len(x.Labels) != 2 {
-          					verr = refuse("%s has a data block without two labels.", id)
-          				} else if err := checkData(x.Labels[0], baseDataTypes); err != nil {
-          					verr = err
-          				}
+          			if x.Type == "precondition" || x.Type == "postcondition" {
+          				verr = refuse("%s has a %s, whose outcome can depend on any value. Those are never planned in CI when the pull request changes them.", id, x.Type)
           			}
           		}
           		return nil
@@ -1016,55 +1099,89 @@ jobs:
           	}
           	return nil
           }
+
+          // checkLabels: every label of a block, and of its nested blocks, is an
+          // identifier, so no reason built from one can carry anything else.
+          func checkLabels(b *hclsyntax.Block) error {
+          	for _, l := range b.Labels {
+          		if !identifier.MatchString(l) {
+          			return refuse("a %s block has a label that is not an identifier.", b.Type)
+          		}
+          	}
+          	for _, nb := range b.Body.Blocks {
+          		if err := checkLabels(nb); err != nil {
+          			return err
+          		}
+          	}
+          	return nil
+          }
+
+          func callsFileFunction(b *hclsyntax.Block) bool {
+          	found := false
+          	hclsyntax.VisitAll(b, func(n hclsyntax.Node) hcl.Diagnostics {
+          		if f, ok := n.(*hclsyntax.FunctionCallExpr); ok && fileFunctions[f.Name] {
+          			found = true
+          		}
+          		return nil
+          	})
+          	return found
+          }
+
+          // sameOtherFiles: every regular file of the tier that is not root .tf
+          // configuration (templates, payloads, anything a file function could read)
+          // is byte-identical to main's, and neither side has one the other lacks.
+          func sameOtherFiles(head, base string) error {
+          	list := func(root string) (map[string]bool, error) {
+          		out := map[string]bool{}
+          		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+          			if err != nil {
+          				return err
+          			}
+          			if d.IsDir() {
+          				return nil
+          			}
+          			rel, _ := filepath.Rel(root, p)
+          			if !strings.Contains(rel, string(filepath.Separator)) && strings.HasSuffix(rel, ".tf") {
+          				return nil
+          			}
+          			out[rel] = true
+          			return nil
+          		})
+          		return out, err
+          	}
+          	h, err := list(head)
+          	if err != nil {
+          		return err
+          	}
+          	b, err := list(base)
+          	if err != nil {
+          		return err
+          	}
+          	for rel := range b {
+          		h[rel] = true
+          	}
+          	names := make([]string, 0, len(h))
+          	for rel := range h {
+          		names = append(names, rel)
+          	}
+          	sort.Strings(names)
+          	for _, rel := range names {
+          		if err := sameBytes(filepath.Join(head, rel), filepath.Join(base, rel), rel); err != nil {
+          			return refuse("%s differs from main's, and the configuration reads files. Changed templates and payloads are never planned in CI.", rel)
+          		}
+          	}
+          	return nil
+          }
           GOSRC
           cd "$src"
-          go build -trimpath -o "$RUNNER_TEMP/tfguard" .
+          GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPATH="$RUNNER_TEMP/gopath" GOCACHE="$RUNNER_TEMP/gocache" \
+            "$RUNNER_TEMP/go/bin/go" build -trimpath -o "$RUNNER_TEMP/tfguard" .
 
-      # Main's infrastructure/terraform at the gated commit: the rules'
-      # baseline and the source of the lock file.
-      - name: Extract main's Terraform
-        if: steps.decide.outputs.state == 'planned'
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/base"
-          git -C pr archive --format=tar "$MAIN_SHA" infrastructure/terraform | tar -x -C "$RUNNER_TEMP/base"
-
-      # A release this file knows, checked against the SHA-256 recorded HERE
-      # before it is unzipped. A Terraform upgrade adds a line below (and so
-      # moves caersid's pin).
-      - name: Install Terraform
-        if: steps.decide.outputs.state == 'planned'
-        env:
-          TERRAFORM_VERSION: ${{ inputs.terraform-version }}
-        run: |
-          set -euo pipefail
-          case $TERRAFORM_VERSION in
-            1.14.9) want=2e5cffc20a0b48a67a76268723bd5a10b8666f69b2aa4f04906e206726bedd63 ;;
-            *) echo "::error::Terraform $TERRAFORM_VERSION is not one this workflow knows; add it and its checksum here."; exit 1 ;;
-          esac
-          cd "$RUNNER_TEMP"
-          zip="$RUNNER_TEMP/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
-          curl -fsSL --retry 3 --max-time 300 -o "$zip" \
-            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
-          got=$(sha256sum "$zip")
-          got=${got%% *}
-          if [ "$got" != "$want" ]; then
-            rm -f "$zip"
-            echo "::error::checksum mismatch for Terraform $TERRAFORM_VERSION; nothing installed"
-            exit 1
-          fi
-          mkdir -p "$RUNNER_TEMP/terraform-bin"
-          unzip -o -q "$zip" terraform -d "$RUNNER_TEMP/terraform-bin"
-          rm -f "$zip"
-          chmod 555 "$RUNNER_TEMP/terraform-bin/terraform"
-          echo "ok: Terraform $TERRAFORM_VERSION installed"
-
-      # Per tier: the rules, then a private copy with main's lock file and a
-      # local backend, and terraform init. Init reads no state and holds no
-      # credential. Terraform's output is never printed.
-      # <tier>-state: ready | refused | failed | skipped.
-      - name: Check and prepare the tiers
-        id: prepare
+      # Per tier: tfguard's verdict. <tier>-state: ok | refused | failed |
+      # skipped. A refusal's reason is one line, without control characters,
+      # backticks or pipes.
+      - name: Check the tiers
+        id: rules
         if: steps.decide.outputs.state == 'planned'
         env:
           PLAN_PLATFORM: ${{ steps.tiers.outputs.plan_platform }}
@@ -1072,92 +1189,37 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
-          : > "$RUNNER_TEMP/terraform.rc"
-          head="$GITHUB_WORKSPACE/pr/infrastructure/terraform"
-          base="$RUNNER_TEMP/base/infrastructure/terraform"
           ready=false
           note() { # <tier> <markdown>
             local d
             d="note-$(openssl rand -hex 16)"
             printf '%s-note<<%s\n%s\n%s\n' "$1" "$d" "$2" "$d" >> "$GITHUB_OUTPUT"
           }
-          prepare_tier() { # <tier>: prints nothing from Terraform
-            local tier=$1 rc=0 reason key dir log
-            reason=$("$RUNNER_TEMP/tfguard" "$tier" "$head" "$base") || rc=$?
+          rules() { # <tier>
+            local tier=$1 rc=0 reason
+            reason=$("$RUNNER_TEMP/tfguard" "$tier" "$RUNNER_TEMP/head/infrastructure/terraform" "$RUNNER_TEMP/base/infrastructure/terraform" 2> /dev/null) || rc=$?
+            reason=$(printf '%s' "$reason" | head -n 1 | tr -d '\000-\037\177`|' | head -c 400)
             case $rc in
-              0) ;;
+              0) echo "$tier-state=ok" >> "$GITHUB_OUTPUT"; ready=true; echo "$reason" ;;
               3)
-                reason=${reason//[\`|]/ }
-                echo "::warning title=$tier tier not planned::${reason:0:400}"
-                note "$tier" "$(printf '#### %s tier\n\n**Not planned: %s** George plans this tier locally (`./scripts/plan.sh production %s`).' "$tier" "${reason:0:400}" "$tier")"
-                echo "$tier-state=refused" >> "$GITHUB_OUTPUT"
-                return ;;
+                echo "::warning title=$tier tier not planned::$reason"
+                note "$tier" "$(printf '#### %s tier\n\n**Not planned: %s** George plans this tier locally (`./scripts/plan.sh production %s`).' "$tier" "$reason" "$tier")"
+                echo "$tier-state=refused" >> "$GITHUB_OUTPUT" ;;
               *)
                 note "$tier" "$(printf '#### %s tier\n\n**Not planned: the rules could not be checked.** Read the run.' "$tier")"
-                echo "$tier-state=failed" >> "$GITHUB_OUTPUT"
-                return ;;
+                echo "$tier-state=failed" >> "$GITHUB_OUTPUT" ;;
             esac
-            key=$(sed -nE 's/^[[:space:]]*key[[:space:]]*=[[:space:]]*"([^"]*)".*$/\1/p' "$head/$tier/backend-production.hcl" 2>/dev/null || true)
-            if [ "$key" != "caersid/$tier-production.tfstate" ]; then
-              note "$tier" "$(printf '#### %s tier\n\n**Not planned: the backend key in `%s/backend-production.hcl` is not `caersid/%s-production.tfstate`.**' "$tier" "$tier" "$tier")"
-              echo "$tier-state=refused" >> "$GITHUB_OUTPUT"
-              return
-            fi
-            dir="$RUNNER_TEMP/plan/$tier"
-            mkdir -p "$dir/src" "$dir/environments" "$dir/state"
-            tar -C "$head" -cf - --exclude .terraform --exclude '*.tfplan' --exclude '*.tfstate*' "$tier" | tar -C "$dir/src" -xf -
-            cp "$base/$tier/.terraform.lock.hcl" "$dir/src/$tier/.terraform.lock.hcl"
-            cp "$head/environments/$tier-production.tfvars" "$dir/environments/"
-            printf 'terraform {\n  backend "local" {}\n}\n' > "$dir/src/$tier/zz_ci_backend_override.tf"
-            log="$RUNNER_TEMP/init-$tier.log"
-            rc=0
-            env -i HOME="$HOME" PATH="$RUNNER_TEMP/terraform-bin:/usr/bin:/bin" TF_IN_AUTOMATION=1 TF_INPUT=0 CHECKPOINT_DISABLE=1 \
-              TF_CLI_CONFIG_FILE="$RUNNER_TEMP/terraform.rc" \
-              terraform -chdir="$dir/src/$tier" init -input=false -no-color -lockfile=readonly \
-              -backend-config="path=$dir/state/terraform.tfstate" > "$log" 2>&1 || rc=$?
-            if [ "$rc" -ne 0 ]; then
-              class=unclassified
-              if grep -qE 'dependency lock file|locked provider|provider registry|Failed to query available provider' "$log"; then class=lock-file; fi
-              note "$tier" "$(printf '#### %s tier\n\n**Not planned: init failed (exit %s, class %s).** Terraform'"'"'s output is withheld. To see it, run `./scripts/plan.sh production %s` locally.' "$tier" "$rc" "$class" "$tier")"
-              echo "$tier-state=failed" >> "$GITHUB_OUTPUT"
-              rm -f "$log"
-              return
-            fi
-            rm -f "$log"
-            echo "$tier-state=ready" >> "$GITHUB_OUTPUT"
-            ready=true
-            echo "ok: $tier prepared"
           }
-          if [ "$PLAN_PLATFORM" = true ]; then prepare_tier platform; else echo "platform-state=skipped" >> "$GITHUB_OUTPUT"; fi
-          if [ "$PLAN_COMPUTE" = true ]; then prepare_tier compute; else echo "compute-state=skipped" >> "$GITHUB_OUTPUT"; fi
+          if [ "$PLAN_PLATFORM" = true ]; then rules platform; else echo "platform-state=skipped" >> "$GITHUB_OUTPUT"; fi
+          if [ "$PLAN_COMPUTE" = true ]; then rules compute; else echo "compute-state=skipped" >> "$GITHUB_OUTPUT"; fi
           echo "ready=$ready" >> "$GITHUB_OUTPUT"
 
-      # One archive for the plan job: the prepared tiers and the Terraform
-      # binary. Its SHA-256 goes through a job output, which the plan job
-      # checks before it extracts anything.
-      - name: Package the prepared tiers
-        id: package
-        if: steps.prepare.outputs.ready == 'true'
-        run: |
-          set -euo pipefail
-          tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/plan-input.tar" plan terraform-bin terraform.rc
-          sum=$(sha256sum "$RUNNER_TEMP/plan-input.tar")
-          echo "digest=${sum%% *}" >> "$GITHUB_OUTPUT"
-
-      - if: steps.prepare.outputs.ready == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: terraform-plan-input
-          path: ${{ runner.temp }}/plan-input.tar
-          retention-days: 1
-          if-no-files-found: error
-
-  # The only job with id-token: write. It runs nothing from the pull request
-  # except Terraform's evaluation of the prepared configuration: no checkout,
-  # no az, no init. Per tier it mints one GitHub ID token into a 0600 file,
-  # checks its audience and subject, and runs the plan in a process whose
-  # environment has no ACTIONS_ID_TOKEN_REQUEST_* (so Terraform can read the
-  # file, but cannot mint), and deletes the file.
+  # The only job with id-token: write. It runs no action: every step is this
+  # file's own code. It fetches the same two commits itself, installs a
+  # checksummed Terraform and runs init (main's lock, read-only) in steps
+  # that exec without ACTIONS_ID_TOKEN_REQUEST_*. Per tier it rechecks main,
+  # mints one ID token into a 0600 file (audience and exact subject checked),
+  # execs into the plan without the request variables, and deletes the file.
   plan:
     needs: [gate, prepare]
     # Literal ids and repository: nothing a caller passes. run_attempt 1 only.
@@ -1174,32 +1236,22 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
+      contents: read
       id-token: write
     outputs:
       platform-summary: ${{ steps.collect.outputs.platform-summary }}
       compute-summary: ${{ steps.collect.outputs.compute-summary }}
     env:
+      REPO: ${{ github.repository }}
+      HEAD_SHA: ${{ needs.gate.outputs.head-sha }}
+      MAIN_SHA: ${{ needs.gate.outputs.main-sha }}
       PLAN_CLIENT_ID: f021a221-0d35-4931-bf82-06144ff184a2
       PLAN_TENANT_ID: 79f0cb1a-28e2-448a-858b-8d37bb32bd24
       STATE_ACCOUNT: tlsntfstate
       STATE_CONTAINER: tfstate
-      DIGEST: ${{ needs.prepare.outputs.digest }}
+      PLATFORM_OK: ${{ needs.prepare.outputs.platform-state == 'ok' }}
+      COMPUTE_OK: ${{ needs.prepare.outputs.compute-state == 'ok' }}
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: terraform-plan-input
-          path: ${{ runner.temp }}/in
-
-      - name: Check and unpack the prepared tiers
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP"
-          [[ $DIGEST =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no digest from the prepare job"; exit 1; }
-          got=$(sha256sum "$RUNNER_TEMP/in/plan-input.tar")
-          [ "${got%% *}" = "$DIGEST" ] || { echo "::error::the prepared archive is not the one the prepare job made"; exit 1; }
-          tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/in/plan-input.tar"
-          rm -rf "$RUNNER_TEMP/in"
-
       # The scripts, written from THIS file (the pinned one). tests/
       # terraform-plan/run.sh extracts and tests the same text.
       - name: Write the plan scripts
@@ -1213,8 +1265,8 @@ jobs:
           #!/usr/bin/env bash
           # mint-token.sh <file>: one GitHub ID token for Azure, into <file>
           # (mode 0600). Its audience must be api://AzureADTokenExchange and
-          # its subject exactly this pinned workflow's on caersid's pull
-          # request. Needs ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN; prints
+          # its subject exactly this workflow, pinned by commit id (the ref is
+          # its own job_workflow_sha), on caersid's pull request. Needs ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN; prints
           # nothing of the token.
           set -euo pipefail
           out=$1
@@ -1236,14 +1288,64 @@ jobs:
             .aud == "api://AzureADTokenExchange"
             and .repository == "Talieisin/caersid"
             and .event_name == "pull_request"
-            and (.job_workflow_ref | type == "string" and startswith("Talieisin/.github/.github/workflows/terraform-plan.yml@"))
             and (.job_workflow_sha | type == "string" and test("^[0-9a-f]{40}$"))
+            and .job_workflow_ref == ("Talieisin/.github/.github/workflows/terraform-plan.yml@" + .job_workflow_sha)
             and .sub == ("repo:Talieisin/caersid:pull_request:job_workflow_ref:" + .job_workflow_ref)
           ' <<<"$claims" > /dev/null 2>&1 || { echo "the ID token's audience or subject is not this workflow's"; exit 5; }
           printf '%s' "$jwt" > "$out"
           chmod 600 "$out"
           unset jwt
           echo "ok: ID token minted and checked"
+          SCRIPT
+
+          cat > "$bin/prepare-tiers.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          # prepare-tiers.sh: for each tier tfguard passed (PLATFORM_OK,
+          # COMPUTE_OK), a private copy of the head's tier with main's lock
+          # file and a local backend, and terraform init (read-only lock) in a
+          # clean environment. Started without ACTIONS_ID_TOKEN_REQUEST_*.
+          # Writes $RUNNER_TEMP/plan/<tier>/ready, or the tier's summary with a
+          # fixed failure paragraph. Terraform's output is never printed.
+          set -euo pipefail
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}${GH_TOKEN:-}" ]; then
+            echo "::error::prepare-tiers.sh must start without the ID token request variables or a GitHub token"; exit 2
+          fi
+          cd "$RUNNER_TEMP"
+          umask 077
+          : > "$RUNNER_TEMP/terraform.rc"
+          head="$RUNNER_TEMP/head/infrastructure/terraform"
+          base="$RUNNER_TEMP/base/infrastructure/terraform"
+          prepare() { # <tier>
+            local tier=$1 key dir rc=0 class=unclassified log
+            key=$(sed -nE 's/^[[:space:]]*key[[:space:]]*=[[:space:]]*"([^"]*)".*$/\1/p' "$head/$tier/backend-production.hcl" 2>/dev/null || true)
+            if [ "$key" != "caersid/$tier-production.tfstate" ]; then
+              printf '#### %s tier\n\n**Not planned: the backend key in `%s/backend-production.hcl` is not `caersid/%s-production.tfstate`.**\n' "$tier" "$tier" "$tier" > "$RUNNER_TEMP/$tier.md"
+              return
+            fi
+            dir="$RUNNER_TEMP/plan/$tier"
+            mkdir -p "$dir/src" "$dir/environments" "$dir/state"
+            tar -C "$head" -cf - --exclude .terraform --exclude '*.tfplan' --exclude '*.tfstate*' "$tier" | tar -C "$dir/src" -xf -
+            cp "$base/$tier/.terraform.lock.hcl" "$dir/src/$tier/.terraform.lock.hcl"
+            cp "$head/environments/$tier-production.tfvars" "$dir/environments/"
+            printf 'terraform {\n  backend "local" {}\n}\n' > "$dir/src/$tier/zz_ci_backend_override.tf"
+            log="$RUNNER_TEMP/init-$tier.log"
+            env -i HOME="$HOME" PATH="$RUNNER_TEMP/terraform-bin:/usr/bin:/bin" TF_IN_AUTOMATION=1 TF_INPUT=0 CHECKPOINT_DISABLE=1 \
+              TF_CLI_CONFIG_FILE="$RUNNER_TEMP/terraform.rc" \
+              terraform -chdir="$dir/src/$tier" init -input=false -no-color -lockfile=readonly \
+              -backend-config="path=$dir/state/terraform.tfstate" > "$log" 2>&1 || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              if grep -qE 'dependency lock file|locked provider|provider registry|Failed to query available provider' "$log"; then class=lock-file; fi
+              rm -f "$log"
+              printf '#### %s tier\n\n**Not planned: init failed (exit %s, class %s).** Terraform'"'"'s output is withheld. To see it, run `./scripts/plan.sh production %s` locally.\n' "$tier" "$rc" "$class" "$tier" > "$RUNNER_TEMP/$tier.md"
+              echo "::error title=$tier tier not planned::init failed (exit $rc, class $class)."
+              return
+            fi
+            rm -f "$log"
+            : > "$dir/ready"
+            echo "ok: $tier initialised"
+          }
+          if [ "$PLATFORM_OK" = true ]; then prepare platform; fi
+          if [ "$COMPUTE_OK" = true ]; then prepare compute; fi
           SCRIPT
 
           cat > "$bin/plan-summary.sh" <<'SCRIPT'
@@ -1345,8 +1447,8 @@ jobs:
           umask 077
           work=$(mktemp -d "$RUNNER_TEMP/plan-tier.XXXXXX")
           trap 'rm -f "$jwt" "$statefile"; rm -rf "$work"' EXIT
-          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
-            echo "::error::plan-tier.sh must start without the ID token request variables"; exit 2
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}${GH_TOKEN:-}" ]; then
+            echo "::error::plan-tier.sh must start without the ID token request variables or a GitHub token"; exit 2
           fi
           [ -f "$jwt" ] || exit 2
 
@@ -1514,31 +1616,101 @@ jobs:
           chmod 500 "$bin"/*.sh
           chmod 500 "$bin"
 
-      # Per tier: mint (this step's shell has the request variables), then
-      # exec into plan-tier.sh without them, so neither the plan nor this
-      # step's process still holds the means to mint.
-      - name: Plan the platform tier
-        if: needs.prepare.outputs.platform-state == 'ready'
+      # The same two commits, fetched here by commit id (git checks every
+      # object against its id): nothing is handed over from another job.
+      - name: Fetch the head and main
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/tfplan-bin/mint-token.sh" "$RUNNER_TEMP/oidc/platform.jwt"
-          exec env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
-            "$RUNNER_TEMP/tfplan-bin/plan-tier.sh" platform "$RUNNER_TEMP/platform.md" "$RUNNER_TEMP/oidc/platform.jwt"
+          # By commit id: git verifies every object it receives against its id. The
+          # token goes in through the environment, never an argument.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          repo="$RUNNER_TEMP/repo"
+          git init -q "$repo"
+          git -C "$repo" fetch -q --no-tags --depth=1 "https://github.com/$REPO" "$HEAD_SHA" "$MAIN_SHA"
+          mkdir -p "$RUNNER_TEMP/head" "$RUNNER_TEMP/base"
+          git -C "$repo" archive --format=tar "$HEAD_SHA" infrastructure/terraform | tar -x -C "$RUNNER_TEMP/head"
+          git -C "$repo" archive --format=tar "$MAIN_SHA" infrastructure/terraform | tar -x -C "$RUNNER_TEMP/base"
+          rm -rf "$repo"
+          echo "ok: the head and main fetched"
+
+      # A release this file knows, checked against the SHA-256 recorded HERE.
+      - name: Install Terraform
+        env:
+          TERRAFORM_VERSION: ${{ inputs.terraform-version }}
+        run: |
+          set -euo pipefail
+          case $TERRAFORM_VERSION in
+            1.14.9) want=2e5cffc20a0b48a67a76268723bd5a10b8666f69b2aa4f04906e206726bedd63 ;;
+            *) echo "::error::Terraform $TERRAFORM_VERSION is not one this workflow knows; add it and its checksum here."; exit 1 ;;
+          esac
+          cd "$RUNNER_TEMP"
+          zip="$RUNNER_TEMP/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          curl -fsSL --retry 3 --max-time 300 -o "$zip" \
+            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          got=$(sha256sum "$zip")
+          if [ "${got%% *}" != "$want" ]; then
+            rm -f "$zip"
+            echo "::error::checksum mismatch for Terraform $TERRAFORM_VERSION; nothing installed"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/terraform-bin"
+          unzip -o -q "$zip" terraform -d "$RUNNER_TEMP/terraform-bin"
+          rm -f "$zip"
+          chmod 555 "$RUNNER_TEMP/terraform-bin/terraform"
+          echo "ok: Terraform $TERRAFORM_VERSION installed"
+
+      # Init parses the pull request's configuration: this step's process
+      # gives up the ID token request variables before anything runs.
+      - name: Prepare the tiers
+        run: exec env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN "$RUNNER_TEMP/tfplan-bin/prepare-tiers.sh"
+
+      # Per tier: main must not have moved since the gate; mint (this step's
+      # shell has the request variables), then exec into plan-tier.sh
+      # without them or the GitHub token, so neither the plan nor this step's
+      # process still holds the means to mint.
+      - name: Plan the platform tier
+        if: env.PLATFORM_OK == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tier=platform
+          [ -f "$RUNNER_TEMP/plan/$tier/ready" ] || exit 0
+          now=$(gh api "repos/$REPO/commits/main" --jq '.sha')
+          if [ "$now" != "$MAIN_SHA" ]; then
+            printf '#### %s tier\n\n**Not planned: main moved during this run.** Push again (after a rebase if main changed Terraform).\n' "$tier" > "$RUNNER_TEMP/$tier.md"
+            exit 0
+          fi
+          "$RUNNER_TEMP/tfplan-bin/mint-token.sh" "$RUNNER_TEMP/oidc/$tier.jwt"
+          exec env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u GH_TOKEN \
+            "$RUNNER_TEMP/tfplan-bin/plan-tier.sh" "$tier" "$RUNNER_TEMP/$tier.md" "$RUNNER_TEMP/oidc/$tier.jwt"
 
       - name: Plan the compute tier
-        if: ${{ !cancelled() && needs.prepare.outputs.compute-state == 'ready' }}
+        if: ${{ !cancelled() && env.COMPUTE_OK == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/tfplan-bin/mint-token.sh" "$RUNNER_TEMP/oidc/compute.jwt"
-          exec env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
-            "$RUNNER_TEMP/tfplan-bin/plan-tier.sh" compute "$RUNNER_TEMP/compute.md" "$RUNNER_TEMP/oidc/compute.jwt"
+          tier=compute
+          [ -f "$RUNNER_TEMP/plan/$tier/ready" ] || exit 0
+          now=$(gh api "repos/$REPO/commits/main" --jq '.sha')
+          if [ "$now" != "$MAIN_SHA" ]; then
+            printf '#### %s tier\n\n**Not planned: main moved during this run.** Push again (after a rebase if main changed Terraform).\n' "$tier" > "$RUNNER_TEMP/$tier.md"
+            exit 0
+          fi
+          "$RUNNER_TEMP/tfplan-bin/mint-token.sh" "$RUNNER_TEMP/oidc/$tier.jwt"
+          exec env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u GH_TOKEN \
+            "$RUNNER_TEMP/tfplan-bin/plan-tier.sh" "$tier" "$RUNNER_TEMP/$tier.md" "$RUNNER_TEMP/oidc/$tier.jwt"
 
       - name: Collect the summaries
         id: collect
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          rm -rf "$RUNNER_TEMP/oidc" "$RUNNER_TEMP/plan"
+          rm -rf "$RUNNER_TEMP/oidc" "$RUNNER_TEMP/plan" "$RUNNER_TEMP/head" "$RUNNER_TEMP/base"
           for tier in platform compute; do
             f="$RUNNER_TEMP/$tier.md"
             [ -s "$f" ] || continue
@@ -1578,6 +1750,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          MAIN_SHA: ${{ needs.gate.outputs.main-sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GATE_RESULT: ${{ needs.gate.result }}
           GATE: ${{ needs.gate.outputs.result }}
@@ -1649,9 +1822,25 @@ jobs:
                 if flag "$IDENTITY"; then
                   printf '**identity tier changed.** Validated only. It is never planned in CI (#588): its state holds the sign-in client secret, and identity work is George'"'"'s. He plans it: `./scripts/plan.sh production` (and `local`).\n\n'
                 fi
-                printf '<sub>Head `%s` · [run](%s) · Planned as `id-caersid-plan-prod` by the pinned Talieisin/.github workflow, from the pushed head with main'"'"'s lock files and a copy of the recorded state, refresh on, no lock. Names only: no value and no instance key is shown (the number of rows is). Not an approval: George plans and applies every tier himself.</sub>\n' "${EVENT_HEAD:0:7}" "$RUN_URL"
+                planned=false
+                for s in "$PLATFORM_SUMMARY" "$COMPUTE_SUMMARY"; do
+                  if [ -n "$s" ] && ! grep -qF '**Not planned:' <<<"$s"; then planned=true; fi
+                done
+                if [ "$planned" = true ]; then
+                  printf '<sub>Head `%s` · [run](%s) · Planned as `id-caersid-plan-prod` by the pinned Talieisin/.github workflow, from the pushed head with main'"'"'s lock files and a copy of the recorded state, refresh on, no lock. Names only: no value and no instance key is shown (the number of rows is). Not an approval: George plans and applies every tier himself.</sub>\n' "${EVENT_HEAD:0:7}" "$RUN_URL"
+                else
+                  printf '<sub>Head `%s` · [run](%s) · No tier was planned in this run. Not an approval: George plans and applies every tier himself.</sub>\n' "${EVENT_HEAD:0:7}" "$RUN_URL"
+                fi
               } > "$RUNNER_TEMP/body.md"
               BODY=$(cat "$RUNNER_TEMP/body.md")
+            fi
+          fi
+          # A plan against a main that has since moved is out of date: say so
+          # instead of publishing it.
+          if [ -n "$MAIN_SHA" ]; then
+            main_now=$(gh api "repos/$REPO/commits/main" --jq '.sha')
+            if [ "$main_now" != "$MAIN_SHA" ]; then
+              note "**Not published: main moved during this run.** Push again (after a rebase if main changed Terraform)."
             fi
           fi
           # A newer push has its own run: an older run that finishes later
