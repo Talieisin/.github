@@ -3,14 +3,18 @@
 # #602). The scripts under test are extracted from the workflow itself, so the
 # tests run exactly the text the pinned workflow runs:
 #   - the gate's push-chain verdict (jq);
+#   - the gate's commit check (jq);
 #   - plan-summary.sh: names only, instance keys hidden;
-#   - tier-rules.sh: the rules on what Terraform would load, against a
-#     throwaway git repository shaped like caersid's tiers.
-# Also shellchecks every extracted script when shellcheck is installed.
+#   - mint-token.sh: audience and subject checks, the 0600 file;
+#   - plan-tier.sh: refuses to start with the ID token request variables;
+#   - tfguard (the HCL rules): the copy embedded in the workflow is
+#     tools/tfguard, byte for byte, and its Go tests pass.
+# Also shellchecks every extracted script (a missing shellcheck or go fails).
 #
 #   tests/terraform-plan/run.sh [workflow file]
 #
-# Needs bash, git, jq, yq (mikefarah, v4) and awk. Exit 0 when every test passes.
+# Needs bash, git, jq, yq (mikefarah, v4), awk, shellcheck and go.
+# Exit 0 when every test passes.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -36,7 +40,7 @@ extract() { # <name>: the heredoc that writes $bin/<name>.sh
   [ -s "$work/$1.sh" ] || { echo "could not extract $1.sh" >&2; exit 2; }
   chmod +x "$work/$1.sh"
 }
-for s in plan-summary check-identity tier-rules plan-tier; do extract "$s"; done
+for s in mint-token plan-summary check-identity plan-tier; do extract "$s"; done
 
 gate=$(yq '.jobs.gate.steps[0].run' "$wf")
 verdict_prog=$(awk '
@@ -122,139 +126,51 @@ rc=0; "$work/plan-summary.sh" identity <<<"$plan" > /dev/null 2>&1 || rc=$?
 expect "summary: unknown tier" 2 "$rc"
 
 
-# --- Tier rules ---------------------------------------------------------------
-repo="$work/repo"
-tier="$repo/infrastructure/terraform/compute"
-envdir="$repo/infrastructure/terraform/environments"
-mkdir -p "$tier/files" "$envdir"
-cat > "$tier/versions.tf" <<'TF'
-terraform {
-  required_version = ">= 1.14.0, < 2.0.0"
-  required_providers {
-    azurerm = {
-      source  = "hashicorp/azurerm"
-      version = "~> 5.12.0"
-    }
-  }
+# --- mint-token.sh --------------------------------------------------------------
+# A fake curl prints $FAKE_RESP; the claims are what the script must judge.
+fake="$work/fakebin"; mkdir -p "$fake"
+printf '#!/usr/bin/env bash\ncat > /dev/null\nprintf "%%s" "$FAKE_RESP"\n' > "$fake/curl"; chmod +x "$fake/curl"
+b64url() { printf '%s' "$1" | base64 | tr -d '=\n' | tr '/+' '_-'; }
+jwt_with() { printf 'eyJhbGciOiJSUzI1NiJ9.%s.c2ln' "$(b64url "$1")"; }
+WF='Talieisin/.github/.github/workflows/terraform-plan.yml@0123456789abcdef0123456789abcdef01234567'
+good=$(jq -cn --arg r "$WF" '{aud: "api://AzureADTokenExchange", repository: "Talieisin/caersid", event_name: "pull_request", job_workflow_ref: $r, job_workflow_sha: "0123456789abcdef0123456789abcdef01234567", sub: ("repo:Talieisin/caersid:pull_request:job_workflow_ref:" + $r)}')
+mint() { # <claims json>: exit status of mint-token.sh with that token
+  local rc=0
+  rm -f "$work/token"
+  FAKE_RESP=$(jq -cn --arg v "$(jwt_with "$1")" '{value: $v}') PATH="$fake:$PATH" \
+    ACTIONS_ID_TOKEN_REQUEST_URL='https://example.invalid/?x=1' ACTIONS_ID_TOKEN_REQUEST_TOKEN=t \
+    "$work/mint-token.sh" "$work/token" > /dev/null 2>&1 || rc=$?
+  echo "$rc"
 }
+expect "mint: a good token" 0 "$(mint "$good")"
+mode=$(stat -c '%a' "$work/token" 2> /dev/null || stat -f '%Lp' "$work/token")
+expect "mint: the file is 0600" 600 "$mode"
+expect "mint: another audience" 5 "$(mint "$(jq -c '.aud = "api://other"' <<<"$good")")"
+expect "mint: the default subject" 5 "$(mint "$(jq -c '.sub = "repo:Talieisin/caersid:pull_request"' <<<"$good")")"
+expect "mint: another workflow file" 5 "$(mint "$(jq -c '.job_workflow_ref = "Talieisin/.github/.github/workflows/other.yml@x" | .sub = ("repo:Talieisin/caersid:pull_request:job_workflow_ref:" + .job_workflow_ref)' <<<"$good")")"
+expect "mint: another repository" 5 "$(mint "$(jq -c '.repository = "Talieisin/other"' <<<"$good")")"
+expect "mint: another event" 5 "$(mint "$(jq -c '.event_name = "push"' <<<"$good")")"
+rc=0; PATH="$fake:$PATH" "$work/mint-token.sh" "$work/token" > /dev/null 2>&1 || rc=$?
+expect "mint: no request variables" 5 "$rc"
 
-provider "azurerm" {
-  subscription_id = var.subscription_id
-  features {}
-}
-TF
-printf 'terraform {\n  backend "azurerm" {}\n}\n' > "$tier/backend.tf"
-cat > "$tier/main.tf" <<'TF'
-data "terraform_remote_state" "platform" {
-  backend = "azurerm"
-  config = {
-    key              = "caersid/platform-production.tfstate"
-    use_azuread_auth = true
-  }
-}
-TF
-cat > "$tier/storage.tf" <<'TF'
-# Static site storage.
-resource "azurerm_storage_account" "this" {
-  name     = "st"
-  provider = azurerm
-}
+# --- plan-tier.sh ----------------------------------------------------------------
+: > "$work/jwt"
+rc=0; RUNNER_TEMP=$work ACTIONS_ID_TOKEN_REQUEST_URL=x "$work/plan-tier.sh" platform "$work/s.md" "$work/jwt" > /dev/null 2>&1 || rc=$?
+expect "plan-tier: refuses the request variables" 2 "$rc"
 
-resource "azurerm_storage_blob" "serve" {
-  name   = "serve.json"
-  source = "${path.module}/files/serve.json"
-}
-TF
-printf 'variable "subscription_id" {\n  type = string\n}\n' > "$tier/variables.tf"
-printf '{}\n' > "$tier/files/serve.json"
-printf 'provider "registry.terraform.io/hashicorp/azurerm" {\n  version = "5.12.0"\n}\n' > "$tier/.terraform.lock.hcl"
-printf 'subscription_id = "x"\n' > "$envdir/compute-production.tfvars"
-git -C "$repo" init -q
-git -C "$repo" -c user.name=t -c user.email=t@example.invalid add -A
-git -C "$repo" -c user.name=t -c user.email=t@example.invalid commit -q -m base
-base=$(git -C "$repo" rev-parse HEAD)
-reset() { git -C "$repo" checkout -q -- . && git -C "$repo" clean -qfdx; }
-rules() { # <name> <want exit> [want reason prefix]: after the mutation in the working tree
-  local rc=0 reason
-  reason=$(BASE_SHA=$base RUNNER_TEMP=$work "$work/tier-rules.sh" compute "$repo" 2>&1) || rc=$?
-  if [ "$rc" = "$2" ] && [[ $reason == "${3:-}"* ]]; then ok; else bad "rules: $1: want exit $2 ${3:+'$3…'}, got exit $rc '$reason'"; fi
-  reset
-}
-append() { printf '%b' "$2" >> "$tier/$1"; }
-
-# Planned: ordinary changes, including the false positives of a keyword scan.
-rules "unchanged" 0 "ok:"
-append storage.tf '\nresource "azurerm_storage_container" "c" {\n  name = "c"\n}\n'
-rules "a new resource" 0 "ok:"
-append storage.tf '\nresource "azurerm_role_assignment" "r" {\n  scope              = "/subscriptions/x/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/st"\n  role_definition_id = "/providers/Microsoft.Authorization/roleDefinitions/abc"\n}\n'
-rules "a resource ID with /providers/" 0 "ok:"
-append storage.tf '\nresource "azurerm_storage_blob" "b" {\n  source = "${path.module}/files/b.json"\n}\n'
-rules "path.module" 0 "ok:"
-append storage.tf '\n# The backend and the provider are set in versions.tf; no module here.\n// terraform { } lives elsewhere\n'
-rules "comment lines naming keywords" 0 "ok:"
-append storage.tf '\noutput "e" {\n  value = azurerm_storage_account.this.primary_web_endpoint\n}\n'
-rules "an endpoint attribute" 0 "ok:"
-awk '/provider = azurerm/ { held = $0; next } { print } END { print held }' "$tier/storage.tf" > "$work/s" && mv "$work/s" "$tier/storage.tf"
-rules "a risky line moved within its file" 0 "ok:"
-
-# Not planned: frozen files.
-append versions.tf '\n# a comment\n'
-rules "versions.tf changed at all" 3 "versions.tf differs"
-awk '{ print } /^provider "azurerm"/ { print "  metadata_host = \"evil.example\"" }' "$tier/versions.tf" > "$work/v" && mv "$work/v" "$tier/versions.tf"
-rules "metadata_host in the provider block" 3 "versions.tf differs"
-mv "$tier/versions.tf" "$tier/providers.tf"
-rules "versions.tf renamed" 3 "versions.tf differs"
-rm "$tier/backend.tf"
-rules "backend.tf removed" 3 "backend.tf differs"
-sed -i.bak 's/use_azuread_auth = true/use_azuread_auth = true\n    ${"oidc"}_request_url = "https:\/\/evil.example"/' "$tier/main.tf" && rm "$tier/main.tf.bak"
-rules "a built key in the remote-state config" 3 "main.tf mentions terraform_remote_state"
-append main.tf '\nlocals {\n  x = 1\n}\n'
-rules "any change to the remote-state file" 3 "main.tf mentions terraform_remote_state"
-append storage.tf '\ndata "terraform_remote_state" "x" {\n  backend = "http"\n  config  = merge({}, jsondecode(var.c))\n}\n'
-rules "remote state in another file" 3 "storage.tf mentions terraform_remote_state"
-printf 'subscription_id = "y"\n' > "$envdir/compute-production.tfvars"
-rules "tfvars changed" 3 "the tier's tfvars file differs"
-printf 'c = "{}"\n' > "$tier/extra.auto.tfvars"
-rules "an auto.tfvars file" 3 "extra.auto.tfvars differs"
-printf 'c = "{}"\n' > "$tier/terraform.tfvars"
-rules "a terraform.tfvars file" 3 "terraform.tfvars differs"
-append .terraform.lock.hcl '\n'
-rules "lock file changed" 3 "the tier's .terraform.lock.hcl differs"
-
-# Not planned: modules, links, special files, risky lines.
-append storage.tf '\nmodule x {\n  source = "./m"\n}\n'
-rules "a bare-label module" 3 "storage.tf adds"
-append storage.tf '\nmodule"x"{\n  source = "./m"\n}\n'
-rules "a module without spaces" 3 "storage.tf adds"
-append storage.tf '\n/**/ module "m" { source = "./m" }\n'
-rules "a module after an inline comment" 3 "storage.tf adds"
-mkdir -p "$tier/m" && printf 'data "terraform_remote_state" "x" {\n  backend = "http"\n}\n' > "$tier/m/main.tf"
-rules "configuration in a subdirectory" 3 "a subdirectory of the tier"
-printf '{}\n' > "$tier/files/x.tf.json"
-rules "JSON configuration in a subdirectory" 3 "a subdirectory of the tier"
-{ printf 'provider "azurerm" {\n  alias = "x"\n}\n'; for _ in $(seq 1 20000); do echo '# padding padding padding padding'; done; } > "$tier/aaa.tf"
-rules "a new provider block, then a large file" 3 "aaa.tf adds"
-append storage.tf '\n/**/ provider "azurerm" { alias = "y" }\n'
-rules "a provider after an inline comment" 3 "storage.tf adds"
-append storage.tf '\nresource "x" "y" {\n  provider = azurerm.y\n}\n'
-rules "a provider meta-argument" 3 "storage.tf adds"
-ln -s ../environments/compute-production.tfvars "$tier/link.tf"
-rules "a symbolic link .tf" 3 "the tier contains a symbolic link"
-rm "$envdir/compute-production.tfvars" && ln -s /etc/hosts "$envdir/compute-production.tfvars"
-rules "a symbolic link tfvars" 3 "the tier's tfvars file is a symbolic link"
-printf '*.tf -diff\n' > "$repo/.gitattributes"
-append storage.tf '\nprovider "azurerm" {\n  alias = "z"\n}\n'
-rules ".gitattributes -diff with a provider" 3 "storage.tf adds"
-mkdir -p "$tier/terraform.d/plugins"
-rules "terraform.d" 3 "the tier has an override file"
-printf '{}\n' > "$tier/x.tf.json"
-rules ".tf.json" 3 "the tier has an override file"
-printf 'resource "x" "y" {}\n' > "$tier/storage_override.tf"
-rules "an override file" 3 "the tier has an override file"
-rc=0; BASE_SHA=$base "$work/tier-rules.sh" identity "$repo" > /dev/null 2>&1 || rc=$?
-expect "rules: unknown tier" 2 "$rc"
-rc=0; BASE_SHA=nope "$work/tier-rules.sh" compute "$repo" > /dev/null 2>&1 || rc=$?
-expect "rules: no base" 2 "$rc"
+# --- tfguard ---------------------------------------------------------------------
+gosrc=$(yq '.jobs.prepare.steps[] | select(.name == "Build tfguard") | .run' "$wf")
+for f in go.mod go.sum main.go; do
+  awk -v f="$f" '
+    $0 == "cat > \"$src/" f "\" <<'"'"'GOSRC'"'"'" { on = 1; next }
+    on && $0 == "GOSRC" { on = 0; next }
+    on { print }' <<<"$gosrc" > "$work/embedded-$f"
+  if cmp -s "$work/embedded-$f" "$here/../../tools/tfguard/$f"; then ok; else bad "tfguard: the workflow's $f is not tools/tfguard/$f"; fi
+done
+if ! command -v go > /dev/null 2>&1; then
+  bad "go is not installed: tfguard's tests did not run"
+elif (cd "$here/../../tools/tfguard" && GOFLAGS=-mod=readonly go test ./... > "$work/go-test.log" 2>&1); then ok
+else bad "tfguard: go test failed"; cat "$work/go-test.log"; fi
 
 echo "passed $pass, failed $fails"
 [ "$fails" -eq 0 ]
