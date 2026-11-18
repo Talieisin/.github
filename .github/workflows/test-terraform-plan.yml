@@ -1,0 +1,43 @@
+name: Test terraform-plan
+# Runs tests/terraform-plan/run.sh: the guard logic of terraform-plan.yml (the
+# pinned Terraform plan workflow for Talieisin/caersid, #602), extracted from
+# the workflow file itself. No credentials, read-only.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/terraform-plan.yml
+      - .github/workflows/test-terraform-plan.yml
+      - tests/terraform-plan/**
+      - tools/tfguard/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/terraform-plan.yml
+      - .github/workflows/test-terraform-plan.yml
+      - tests/terraform-plan/**
+      - tools/tfguard/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-terraform-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.10"
+          cache: false
+      - name: Guard-logic tests
+        env:
+          GOTOOLCHAIN: local
+        run: bash tests/terraform-plan/run.sh
