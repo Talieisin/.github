@@ -283,8 +283,10 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
-          # A dispatched run's actor is the automation app (the org dispatcher).
-          allowed_bots: "${{ inputs.allowed-bots }},talieisin-org-automation"
+          # A dispatched run's actor is the app the org dispatcher starts it
+          # with: talieisin-org-bootstrap (automation#51), or
+          # talieisin-org-automation before that change.
+          allowed_bots: "${{ inputs.allowed-bots }},talieisin-org-automation,talieisin-org-bootstrap"
           prompt: |
             This working tree is a Dependabot dependency-upgrade PR branch
             (base ${{ needs.gate.outputs.base-ref }} in
