@@ -41,7 +41,9 @@
 //   - no ephemeral, action, module, import, moved, removed, check or
 //     unknown block, no precondition or postcondition, and no dynamic
 //     block whose for_each references a value;
-//   - a resource's type is one main already uses.
+//   - (A new resource type is allowed: creating a resource reads nothing
+//     that exists. Reads at plan time are what the rules above limit:
+//     data sources, imports and ephemeral resources.)
 //   - Symmetrically, none of main's import, moved, removed or check blocks,
 //     and no block of main's with a pre- or postcondition, is removed or
 //     changed.
@@ -637,10 +639,6 @@ func checkTainted(id string, it *item, main mainTypes) error {
 	case "data":
 		if err := checkData(it.block.Labels[0], baseDataTypes); err != nil {
 			return err
-		}
-	case "resource":
-		if !main.resource[it.block.Labels[0]] {
-			return refuse("the pull request adds a %s resource, a type main does not use. New resource types are never planned in CI.", it.block.Labels[0])
 		}
 	}
 	var verr error

@@ -162,6 +162,12 @@ func TestPlanned(t *testing.T) {
 		"a dynamic block with a literal for_each": func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_storage_container\" \"d\" {\n  name = \"d\"\n  dynamic \"x\" {\n    for_each = [\"a\"]\n    content {}\n  }\n}\n")
 		},
+		"a new resource type": func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_key_vault\" \"k\" {\n  name = \"k\"\n}\n")
+		},
+		"a new resource type fed by a new local": func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  n = \"x\"\n}\nresource \"azurerm_key_vault\" \"k\" {\n  name = local.n\n}\n")
+		},
 		"a variable unrelated to the provider changes": func(t *testing.T, head string) {
 			appendTo(t, head, "compute/variables.tf", "\nvariable \"other\" {\n  default = \"x\"\n}\n")
 		},
@@ -292,9 +298,6 @@ func TestRefused(t *testing.T) {
 		{"an unchanged count fed by a changed local", "count that references", func(t *testing.T, head string) {
 			replaceIn(t, head, "compute/storage.tf", "containers = 1", "containers = length(azurerm_storage_account.this.primary_access_key)")
 		}},
-		{"a new resource type", "a type main does not use", func(t *testing.T, head string) {
-			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_key_vault\" \"k\" {\n  name = \"k\"\n}\n")
-		}},
 		{"an import block", "import block", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nimport {\n  to = azurerm_storage_account.this\n  id = \"x\"\n}\n")
 		}},
@@ -325,8 +328,14 @@ func TestRefused(t *testing.T) {
 		{"dot-named configuration", "dot-named configuration", func(t *testing.T, head string) {
 			write(t, head, map[string]string{"compute/.x.tf": "locals {}\n"})
 		}},
-		{"a resource fed by a tainted local", "a type main does not use", func(t *testing.T, head string) {
-			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  n = \"x\"\n}\nresource \"azurerm_key_vault\" \"k\" {\n  name = local.n\n}\n")
+		{"a new resource type that imports", "import block", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_key_vault\" \"k\" {\n  name = \"k\"\n}\nimport {\n  to = azurerm_key_vault.k\n  id = \"x\"\n}\n")
+		}},
+		{"a new resource type reading a file", "calls file()", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_key_vault\" \"k\" {\n  name = file(\"x\")\n}\n")
+		}},
+		{"a new resource type with a count from a value", "count that references", func(t *testing.T, head string) {
+			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_key_vault\" \"k\" {\n  count = length(data.azurerm_client_config.current.object_id)\n  name  = \"k\"\n}\n")
 		}},
 		{"a for_each from a tainted local", "for_each that references", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nlocals {\n  names = toset([data.azurerm_client_config.current.tenant_id])\n}\nresource \"azurerm_storage_container\" \"f\" {\n  for_each = local.names\n  name     = each.key\n}\n")
