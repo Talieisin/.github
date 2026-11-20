@@ -41,7 +41,11 @@
 //   - no ephemeral, action, module, import, moved, removed, check or
 //     unknown block, no precondition or postcondition, and no dynamic
 //     block whose for_each references a value;
-//   - a resource's type is one main already uses.
+//   - (A new resource type is allowed: Terraform asks the provider for no
+//     read of an object it is creating. The plan-time reads the rules above
+//     limit are data sources, imports and ephemeral resources; a provider's
+//     own plan-time checks against ARM, and a new block at an address still
+//     in state, are covered by the accepted residuals.)
 //   - Symmetrically, none of main's import, moved, removed or check blocks,
 //     and no block of main's with a pre- or postcondition, is removed or
 //     changed.
@@ -241,16 +245,13 @@ func check(tier, headRoot, baseRoot string) (string, error) {
 		}
 	}
 
-	main := mainTypes{data: map[string]bool{}, resource: map[string]bool{}}
+	mainDataTypes := map[string]bool{}
 	for _, t := range bm.dataTypes {
-		main.data[t] = true
-	}
-	for _, t := range bm.resourceTypes {
-		main.resource[t] = true
+		mainDataTypes[t] = true
 	}
 	for _, id := range ids {
 		if tainted[id] {
-			if err := checkTainted(id, hm.items[id], main); err != nil {
+			if err := checkTainted(id, hm.items[id], mainDataTypes); err != nil {
 				return "", err
 			}
 		}
@@ -366,15 +367,12 @@ type item struct {
 }
 
 type model struct {
-	frozen        []string
-	frozenBlocks  []*hclsyntax.Block
-	items         map[string]*item
-	dataTypes     []string
-	resourceTypes []string
-	readsFiles    bool
+	frozen       []string
+	frozenBlocks []*hclsyntax.Block
+	items        map[string]*item
+	dataTypes    []string
+	readsFiles   bool
 }
-
-type mainTypes struct{ data, resource map[string]bool }
 
 var identifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
@@ -463,8 +461,6 @@ func load(dir string, isHead bool) (*model, error) {
 				id := b.Labels[0] + "." + b.Labels[1]
 				if b.Type == "ephemeral" {
 					id = "ephemeral." + id
-				} else {
-					m.resourceTypes = append(m.resourceTypes, b.Labels[0])
 				}
 				if err := add(id, &item{kind: b.Type, canon: canon, refs: refsOf(b), node: b, block: b}); err != nil {
 					return nil, err
@@ -624,7 +620,7 @@ func equalMultiset(a, b []string) bool {
 
 // checkTainted: the rules for a block the pull request adds or changes, or
 // one that references such a block.
-func checkTainted(id string, it *item, main mainTypes) error {
+func checkTainted(id string, it *item, baseDataTypes map[string]bool) error {
 	switch it.kind {
 	case "data", "resource", "variable", "output", "local":
 	case "ephemeral":
@@ -632,15 +628,9 @@ func checkTainted(id string, it *item, main mainTypes) error {
 	default:
 		return refuse("the pull request adds or changes a %s block, or one it depends on. Those are never planned in CI.", it.kind)
 	}
-	baseDataTypes := main.data
-	switch it.kind {
-	case "data":
+	if it.kind == "data" {
 		if err := checkData(it.block.Labels[0], baseDataTypes); err != nil {
 			return err
-		}
-	case "resource":
-		if !main.resource[it.block.Labels[0]] {
-			return refuse("the pull request adds a %s resource, a type main does not use. New resource types are never planned in CI.", it.block.Labels[0])
 		}
 	}
 	var verr error
