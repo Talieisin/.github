@@ -328,7 +328,7 @@ func TestRefused(t *testing.T) {
 		{"dot-named configuration", "dot-named configuration", func(t *testing.T, head string) {
 			write(t, head, map[string]string{"compute/.x.tf": "locals {}\n"})
 		}},
-		{"a new resource type that imports", "import block", func(t *testing.T, head string) {
+		{"an import of a new resource type", "import block", func(t *testing.T, head string) {
 			appendTo(t, head, "compute/storage.tf", "\nresource \"azurerm_key_vault\" \"k\" {\n  name = \"k\"\n}\nimport {\n  to = azurerm_key_vault.k\n  id = \"x\"\n}\n")
 		}},
 		{"a new resource type reading a file", "calls file()", func(t *testing.T, head string) {
