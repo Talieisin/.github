@@ -50,7 +50,7 @@ The fingerprint must equal across honest plans of the same change. Those plans c
 - the actions, `replace_paths` and `importing`;
 - the paths whose value differs between `before` and `after`, with their `after` value;
 - the `after_unknown` paths;
-- `output_changes` entries that change, with their `after` values.
+- `output_changes` entries that change, with their actions, `after` values and `after_unknown`, so an output that becomes unknown can't match one that becomes `null`.
 
 **What stays out:**
 - unchanged attributes, no-op resources and `resource_drift`;
@@ -106,7 +106,8 @@ The caller runs on `push` to `main` with `paths: infrastructure/terraform/**`. T
    - **Then checks every tier before applying anything.** Nothing applies if any of these fail:
      - each fingerprint equals its artefact fingerprint;
      - no plan touches a **refused type**: any Terraform type whose Azure resource type is `Microsoft.Authorization/*`, plus federated identity credentials and Cosmos SQL role assignments and role definitions (2.3);
-     - no plan deletes or replaces a resource under a `CanNotDelete` lock's scope (today: the Cosmos account and the Key Vault, from `locks.tf`). Azure would refuse the delete partway through the apply.
+     - no plan deletes or replaces a resource under a `CanNotDelete` lock's scope (today: the Cosmos account and the Key Vault, from `locks.tf`). Azure would refuse the delete partway through the apply;
+     - no tier has a `provisioner` or `connection` block, in any block, changed or not. `local-exec`, `remote-exec` and `file` run commands on the runner during apply, where the token file is reachable. caersid uses none. The rule goes into tfguard when the apply workflow is built; the plan path isn't affected, because provisioners run only at apply.
 
      A refused or mismatched tier stops the whole run, with a fixed comment saying why, and George applies locally.
    - **Apply, in order:** platform first, because compute reads platform's outputs. For each tier, it mints a fresh token file immediately before `apply <tier>.tfplan`, because a GitHub ID token lasts only minutes and apply starts new provider and backend processes that exchange it again.
@@ -209,7 +210,7 @@ The caller runs on `push` to `main` with `paths: infrastructure/terraform/**`. T
 
   These are the cost of a deny-list role; an allow-list would narrow them at the price of the type-by-type upkeep George chose against.
 - **Agent merges count as approval (Section 1).** A misled agent merge applies only a plan that matches a reviewed PR plan; it cannot apply anything that was not planned on the PR.
-- **The PR plan's known channels** (see #44's header) are unchanged. Apply adds no new PR-code execution: it runs only merged code.
+- **The PR plan's known channels** (see #44's header) are unchanged. Apply adds no new code execution: it runs only merged code, and the gate refuses provisioners (2.2), the way Terraform configuration runs commands on the runner at apply.
 - **`data.azurerm_client_config` reads differ by identity.** Only `tenant_id` is used today, which is the same for all of them; a new use of another of its fields would show up as a fingerprint mismatch, not a wrong apply.
 
 ## 7. Sources
