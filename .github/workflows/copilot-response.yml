@@ -22,9 +22,9 @@ on:
         type: string
         default: ""
       model:
-        description: "Claude model alias (sonnet | opus | fable | full name); sonnet suits verifying minor findings on an already-green PR"
+        description: "Claude model: a full model ID (an alias also works but resolves through the action's Claude Code version); Sonnet suits verifying minor findings on an already-green PR"
         type: string
-        default: sonnet
+        default: claude-sonnet-5-5
       allowed-bots:
         description: "Bot actors allowed to trigger the Claude step"
         type: string
@@ -279,7 +279,7 @@ jobs:
       - name: Claude — verify and address Copilot findings (unprivileged)
         id: claude
         continue-on-error: true
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1
+        uses: anthropics/claude-code-action@d5f7970ae232b6039636a16ea7f251e58e814f38 # v1.0.272 (Claude Code 2.1.322)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}

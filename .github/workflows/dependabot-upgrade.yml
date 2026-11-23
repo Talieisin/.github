@@ -4,14 +4,14 @@ name: Dependabot AI upgrade
 # automation runbook.
 #
 #   gate        deterministic provenance checks; records the head SHA
-#   agent       UNPRIVILEGED Claude (fable in upgrade mode, opus in rescue/
-#               suggest; `model` input overrides): analyses
+#   agent       UNPRIVILEGED Claude (Fable 5.2 in upgrade mode, Opus 5.5 in
+#               rescue/suggest; `model` input overrides): analyses
 #               changelogs, adapts code, runs tests; emits patch + JSON
 #               summary artifact. No credentials, no id-token.
 #   push        deterministic round-1 push via the validated-push action
 #   codex       independent read-only adversarial review of the result
 #   codex-post  posts the codex report (PR-write, deterministic)
-#   revise      UNPRIVILEGED Claude round 2 (opus; `review-model`, then
+#   revise      UNPRIVILEGED Claude round 2 (Opus 5.5; `review-model`, then
 #               `model`, override): verifies each codex finding as
 #               an untrusted claim — fixes what is real, rejects what is not,
 #               with evidence. Emits revision patch + disposition summary.
@@ -38,11 +38,11 @@ on:
         type: string
         default: ""
       model:
-        description: "Model override for both agent rounds (fable | opus | sonnet | full model name); empty = per-round/per-mode defaults"
+        description: "Model override for both agent rounds (a full model ID such as claude-opus-5-5; an alias also works but resolves through the action's Claude Code version); empty = per-round/per-mode defaults"
         type: string
         default: ""
       review-model:
-        description: "Round-2 model override, takes precedence over model for round 2; empty = model, else opus"
+        description: "Round-2 model override, takes precedence over model for round 2; empty = model, else claude-opus-5-5"
         type: string
         default: ""
       allowed-bots:
@@ -389,15 +389,18 @@ jobs:
           esac
       # The model is resolved ONCE here: claude_args and the status comment
       # both read this output, so what is recorded is what actually ran.
+      # Full model IDs, not aliases: an alias resolves through the Claude
+      # Code version the action installs, so an action bump would change
+      # the model unseen and the ai-meta marker would not say which ran.
       - name: Resolve round-1 model
         id: pick
         env:
-          MODEL: ${{ inputs.model || (needs.gate.outputs.mode == 'upgrade' && 'fable' || 'opus') }}
+          MODEL: ${{ inputs.model || (needs.gate.outputs.mode == 'upgrade' && 'claude-fable-5-2' || 'claude-opus-5-5') }}
         run: echo "model=$MODEL" >> "$GITHUB_OUTPUT"
       - name: Claude — analyse and adapt (unprivileged)
         id: claude
         continue-on-error: true
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1
+        uses: anthropics/claude-code-action@d5f7970ae232b6039636a16ea7f251e58e814f38 # v1.0.272 (Claude Code 2.1.322)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
@@ -1259,12 +1262,12 @@ jobs:
       - name: Resolve round-2 model
         id: pick
         env:
-          MODEL: ${{ inputs.review-model || inputs.model || 'opus' }}
+          MODEL: ${{ inputs.review-model || inputs.model || 'claude-opus-5-5' }}
         run: echo "model=$MODEL" >> "$GITHUB_OUTPUT"
       - name: Claude — verify and address reviewer findings (unprivileged)
         id: claude
         continue-on-error: true
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1
+        uses: anthropics/claude-code-action@d5f7970ae232b6039636a16ea7f251e58e814f38 # v1.0.272 (Claude Code 2.1.322)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
