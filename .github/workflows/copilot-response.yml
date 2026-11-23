@@ -210,15 +210,15 @@ jobs:
           fi
       - name: Enable pnpm (packageManager-pinned repo)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'true'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.1
       - name: Enable pnpm (no packageManager field)
         if: inputs.setup == 'pnpm' && steps.pnpmv.outputs.from_field == 'false'
-        uses: pnpm/action-setup@v6.0.10
+        uses: pnpm/action-setup@v6.1.1
         with:
           version: "10"
       - name: Set up uv
         if: inputs.setup == 'uv'
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@v10.4.0
       - name: Set up Python (pip)
         if: inputs.setup == 'pip'
         uses: actions/setup-python@v7
@@ -279,7 +279,7 @@ jobs:
       - name: Claude — verify and address Copilot findings (unprivileged)
         id: claude
         continue-on-error: true
-        uses: anthropics/claude-code-action@d5f7970ae232b6039636a16ea7f251e58e814f38 # v1.0.272 (Claude Code 2.1.322)
+        uses: anthropics/claude-code-action@c84e279f859e2591391e95bd309286eb111c345f # v1.0.272 (Claude Code 2.1.322)
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
@@ -384,7 +384,7 @@ jobs:
     steps:
       - name: Mint automation-app token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
@@ -552,7 +552,7 @@ jobs:
           echo "outcome=$outcome" >> "$GITHUB_OUTPUT"
       - name: Mint automation-app token (labels only)
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ secrets.TALIEISIN_AUTOMATION_APP_ID }}
           private-key: ${{ secrets.TALIEISIN_AUTOMATION_APP_PRIVATE_KEY }}
